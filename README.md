@@ -135,6 +135,59 @@ endpoint，路径原样透传，`/api/...`、`/assets/...` 都正常。
 | 保留 Host | `preserveHost: true` + `dsh --profile web --trusted-host <endpoint>.<base>` | `--trusted-host` 不支持通配符，endpoint 必须固定 |
 | 本地化 Host | `preserveHost: false` | 上游以为自己在 `127.0.0.1`，依赖 Host 的绝对跳转/cookie 可能不符合预期 |
 
+## 沙箱与权限：命令到底怎么跑
+
+DSH 把「谁能改文件」拆成三层，插件和启动器都不改写其中任何一层，只提供开关：
+
+| 层 | 位置 | 作用 |
+|---|---|---|
+| 执行器 | 宿主组合里的 `bash-sandbox` 行（`@deepseek-ai/dsh-bash-sandbox`，注册为 `ctx.shell`） | 每条命令都过一遍沙箱包装；只有这一个执行器，没有「无沙箱执行器」可选 |
+| 策略模式 | `sandbox-policy` 行的 `mode`，取自环境变量 `DSH_PERMISSION_MODE`（默认 `workspace-write`） | 新会话的默认模式，决定包装成只读 / 只写工作区 / 不限制 |
+| 会话预设 | `permission` 行的 presets，界面上是权限选择器 | 每个会话可单独选 `read-only` / `workspace-write` / `danger-full-access` |
+
+关键点：**`danger-full-access` 就是「不走沙箱」**。
+`dsh-bash-sandbox` 在该模式下直接 `super.start(spec)` 交给本地执行器，不加任何包装
+（`lib/index.js` 里 `if (mode === "danger-full-access") return super.start(spec)`），
+同时 `approval` 行的 policy 也从 `ask` 变成 `never`，不再弹审批。
+
+因此「很多时候不想让它走沙箱」有三种写法，粒度和持久性递增：
+
+```bash
+# 1. 单个会话：界面右下角的权限选择器切到「完全权限」
+# 2. 这台机器上的新会话默认不走沙箱：
+dsh-piko-remote up --no-sandbox          # = --env DSH_PERMISSION_MODE=danger-full-access
+# 3. 自己显式指定：
+dsh-piko-remote up --env DSH_PERMISSION_MODE=danger-full-access
+```
+
+`--no-sandbox` 只改默认模式（沿用宿主组合的沙箱执行器），**不是**把执行器换成
+`@deepseek-ai/dsh-bash-local`：那样组合直接起不来——`permission` 预设插件会拒绝一个
+没有 `sandboxMode` 的执行器（`the mounted bash executor does not confine (no
+sandboxMode)`），而 `fs-sandbox`、`api-workspace-files`、deliverables 界面都注入
+`sandboxPolicy`，删掉策略行会留下一堆 pending 条目。
+
+### 宿主需要什么才能真的沙箱
+
+Linux 上 DSH 依次探测两条链（`@deepseek-ai/dsh-sandbox-local`）：
+
+| 链 | 探测命令 | 失败时看到 |
+|---|---|---|
+| `bwrap` | `bwrap --ro-bind / / --dev /dev --unshare-pid --proc /proc --die-with-parent -- true` | `bwrap: Can't mount proc on /newroot/proc: Operation not permitted` |
+| `landlock` | 预编译的 `landlock-run` | `/sys/kernel/security/lsm` 里没有 `landlock` |
+
+两条都不可用时，`workspace-write` 会话的每条命令都会被拒绝
+（`No sandbox backend is usable on this host`）并触发一次升权审批——这不是插件的问题，
+而是宿主内核/容器不给能力：
+
+- `bwrap` 需要能建 PID namespace 并挂载新的 `/proc`；LXC 里通常被
+  `lxc.mount.auto` / apparmor / userns 配置挡住（去掉 `--unshare-pid --proc` 能跑，
+  但那不是 DSH 用的 profile）；
+- `landlock` 需要在物理机的内核命令行里启用（Proxmox 默认只开 apparmor），
+  并且该 LSM 必须在容器的 `/sys/kernel/security/lsm` 里出现。
+
+容器里两样都拿不到时，正确做法就是 `--no-sandbox` / `danger-full-access`：命令不加包装地跑，
+也就没有「没法建沙箱所以拒绝执行」这种死路。
+
 ## 部署到远程主机
 
 在无图形界面的 Linux 主机上装 DSH、装本插件、把 Web 界面暴露到公网，完整命令见
@@ -143,7 +196,15 @@ endpoint，路径原样透传，`/api/...`、`/assets/...` 都正常。
 - helper 用 `npm pack` 出来的 **tarball** 安装：用目录安装会变成 `link:`，Node 会从插件的
   真实路径解析裸 import，`schemastery` / `dsh-tools` 全都找不到；
 - `@deepseek-ai/dsh-tools` 是 peerDependency，而 profile 默认 `autoInstallPeers: false`，
-  需要单独 `dsh plugin add @deepseek-ai/dsh-tools@<版本>`；
+  需要让 profile 能解析到它——**要 link，不要另装一份**（见下条）；
+- **同一个 harness 包只能有一份物理拷贝**。`@deepseek-ai/dsh-tools` 用 `Symbol()` 把
+  「工具执行调度器」交给 agent loop，Node 按解析后的真实路径判定模块身份，profile 里多一份
+  拷贝就是多一个 Symbol，agent loop 读到 `undefined`，于是每次工具调用都失败在
+  `Cannot read properties of undefined (reading 'prepare')`。启动器因此把 profile 里
+  `@deepseek-ai/*` 的副本一律换成指向 dsh 自带那几份的软链（并写回
+  `link:` 依赖），手工等价操作：
+  `ln -sfn <dsh>/node_modules/@deepseek-ai/dsh-tools <profile>/node_modules/@deepseek-ai/dsh-tools`
+  并把 package.json 里的版本号改成 `link:<dsh>/node_modules/@deepseek-ai/dsh-tools`；
 - DSH Web 自己还有一道 `?token=` 门（每次启动都变），所以完整地址是
   `https://<endpoint>.<base>/?token=…`，外面再套一层本插件的 Basic Auth。
   自动暴露（`autoExpose`）时用 `credentialsFile` 把地址与随机账号密码以 0600 权限落盘。

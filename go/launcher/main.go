@@ -131,6 +131,10 @@ up flags:
   --data-dir DIR        launcher state (default: XDG data dir)
   --dsh-home DIR        DSH home (default $DSH_HOME or ~/.dsh)
   --timeout SECONDS     how long to wait for boot (default 180)
+  --no-sandbox          start new sessions with the danger-full-access policy:
+                        commands run unwrapped and approvals are off. Use it on
+                        a host whose sandbox has no usable backend; the
+                        per-session permission picker still overrides it
   --force               reinstall node/dsh even when a usable one exists
   --json                print one JSON result object on stdout
 `)
@@ -227,6 +231,7 @@ type upOptions struct {
 	dshHome     string
 	timeout     time.Duration
 	force       bool
+	noSandbox   bool
 	jsonOut     bool
 }
 
@@ -268,6 +273,7 @@ func parseUpFlags(argv []string) (*upOptions, error) {
 	flags.StringVar(&opts.dshHome, "dsh-home", "", "DSH home directory")
 	seconds := flags.Int("timeout", 180, "boot timeout in seconds")
 	flags.BoolVar(&opts.force, "force", false, "reinstall node and dsh")
+	flags.BoolVar(&opts.noSandbox, "no-sandbox", false, "default new sessions to the danger-full-access policy (no sandbox wrapper, no approvals)")
 	flags.BoolVar(&opts.jsonOut, "json", false, "print one JSON result object")
 
 	if err := flags.Parse(argv); err != nil {
@@ -310,6 +316,7 @@ func cmdUp(argv []string) error {
 	if opts.force {
 		log.warn("--force: reinstalling Node and dsh")
 	}
+	opts.childEnv = applyNoSandbox(log, opts.childEnv, os.Environ(), opts.noSandbox)
 
 	plugins, err := expandPluginSpecs(defaultPlugins(opts.plugins))
 	if err != nil {
@@ -341,6 +348,12 @@ func cmdUp(argv []string) error {
 		return err
 	}
 	if err := satisfyPeers(ctx, log, runner, dshPath, opts.profile, installed); err != nil {
+		return err
+	}
+	// Peer resolution can leave a second copy of a harness package behind, and
+	// an earlier run may already have installed one; both break symbol identity
+	// across module boundaries.
+	if err := linkHarnessPackages(log, dshPath, opts.profile); err != nil {
 		return err
 	}
 
@@ -391,8 +404,11 @@ func cmdUp(argv []string) error {
 	// collides with any other DSH already running — including a second profile on
 	// the same machine — and the port is irrelevant to the caller anyway: the
 	// tunnel URL and its target port come from the running server.
-	args = append(args, "--no-open", "--port", fmt.Sprint(opts.port))
+	// Extra args come before the app-level flags: parent-level options such as
+	// --patch must precede the app's own positionals, or the app's parser sees
+	// them and rejects them as unknown.
 	args = append(args, opts.dshArgs...)
+	args = append(args, "--no-open", "--port", fmt.Sprint(opts.port))
 
 	state := runState{
 		Profile:    opts.profile,
@@ -450,19 +466,19 @@ func reportReady(log *logger, opts *upOptions, nodeVersion, dshVersion string, i
 
 	if opts.jsonOut {
 		payload := map[string]any{
-			"event":      "ready",
-			"profile":    state.Profile,
-			"pid":        state.PID,
-			"localUrl":   localURL,
-			"remoteUrl":  publicURL,
-			"endpoint":   state.Endpoint,
-			"authUser":   state.AuthUser,
-			"authPass":   state.AuthPass,
-			"expiresAt":  state.ExpiresAt,
-			"logFile":    state.LogFile,
+			"event":       "ready",
+			"profile":     state.Profile,
+			"pid":         state.PID,
+			"localUrl":    localURL,
+			"remoteUrl":   publicURL,
+			"endpoint":    state.Endpoint,
+			"authUser":    state.AuthUser,
+			"authPass":    state.AuthPass,
+			"expiresAt":   state.ExpiresAt,
+			"logFile":     state.LogFile,
 			"nodeVersion": nodeVersion,
-			"dshVersion": dshVersion,
-			"plugins":    installed,
+			"dshVersion":  dshVersion,
+			"plugins":     installed,
 		}
 		if state.TunnelNote != "" {
 			payload["tunnelNote"] = state.TunnelNote
@@ -542,6 +558,47 @@ func buildChildEnv(base, extra []string, dir string) ([]string, error) {
 		merged = append(merged, key+"="+value)
 	}
 	return withPath(merged, dir), nil
+}
+
+// applyNoSandbox implements --no-sandbox.
+//
+// The flag pins the *default policy mode* to `danger-full-access` instead of
+// swapping the executor plugin. That is the only supported way to run
+// unwrapped: the sandboxed executor short-circuits to the local one in that
+// mode, while an unconfined executor cannot be mounted at all — the permission
+// presets reject one that publishes no `sandboxMode`, and `fs-sandbox`,
+// `api-workspace-files`, and the deliverables UI all require the policy
+// service the sandbox row provides.
+//
+// The mode is what an operator wants anyway: `danger-full-access` also turns
+// approvals off, so a host whose sandbox has no usable backend stops answering
+// every command with a denial and an escalation prompt.
+func applyNoSandbox(log *logger, childEnv, base []string, noSandbox bool) []string {
+	if !noSandbox {
+		return childEnv
+	}
+	if hasEnvEntry(base, permissionModeEnv) || hasEnvEntry(childEnv, permissionModeEnv) {
+		log.warn("--no-sandbox ignored: an explicit %s already decides whether commands are wrapped", permissionModeEnv)
+		return childEnv
+	}
+	log.info("--no-sandbox: new sessions default to %s=danger-full-access", permissionModeEnv)
+	return append(childEnv, permissionModeEnv+"=danger-full-access")
+}
+
+// permissionModeEnv is the environment variable the host composition reads as
+// the default sandbox mode for new sessions.
+const permissionModeEnv = "DSH_PERMISSION_MODE"
+
+// hasEnvEntry reports whether env already carries key, in either the
+// os.Environ or the --env KEY=VALUE shape.
+func hasEnvEntry(env []string, key string) bool {
+	prefix := key + "="
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // withPath returns env with dir first on PATH, replacing any existing PATH

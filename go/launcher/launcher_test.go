@@ -216,7 +216,6 @@ func TestRenderOverlay(t *testing.T) {
 	if strings.Contains(text, "endpoint:") {
 		t.Errorf("an unset endpoint should be omitted:\n%s", text)
 	}
-
 	withEndpoint, err := renderOverlay(overlayConfig{Endpoint: "dsh-demo"})
 	if err != nil {
 		t.Fatal(err)
@@ -224,6 +223,390 @@ func TestRenderOverlay(t *testing.T) {
 	if !strings.Contains(string(withEndpoint), "endpoint: dsh-demo") {
 		t.Errorf("expected the fixed endpoint in the overlay:\n%s", withEndpoint)
 	}
+}
+
+// fakeHarness writes a minimal npm-global DSH install: <prefix>/bin/dsh plus
+// the harness package with the given bundled packages under its own
+// node_modules — the layout `npm install --global --prefix <prefix>` produces.
+func fakeHarness(t *testing.T, packages ...string) string {
+	t.Helper()
+	prefix := t.TempDir()
+	binDir := filepath.Join(prefix, "bin")
+	dshDir := filepath.Join(prefix, "lib", "node_modules", "@deepseek-ai", "dsh")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dshDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "dsh"), []byte("#!/usr/bin/env node\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := `{"name":"@deepseek-ai/dsh","version":"0.1.5-rc.1"}`
+	if err := os.WriteFile(filepath.Join(dshDir, "package.json"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, pkg := range packages {
+		dir := filepath.Join(dshDir, "node_modules", filepath.FromSlash(pkg))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		body := `{"name":"` + pkg + `","version":"0.1.5-rc.2"}`
+		if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return filepath.Join(binDir, "dsh")
+}
+
+func TestHarnessPackageRoot(t *testing.T) {
+	dshPath := fakeHarness(t, "@deepseek-ai/dsh-tools")
+	prefix := filepath.Dir(filepath.Dir(dshPath))
+	// macOS resolves /var to /private/var, so compare resolved paths.
+	want, err := filepath.EvalSymlinks(filepath.Join(prefix, "lib", "node_modules", "@deepseek-ai", "dsh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := harnessPackageRoot(dshPath); got != want {
+		t.Fatalf("harnessPackageRoot = %q, want %q", got, want)
+	}
+	if got := harnessPackageDir(dshPath, "@deepseek-ai/dsh-tools"); got != filepath.Join(want, "node_modules", "@deepseek-ai", "dsh-tools") {
+		t.Fatalf("harnessPackageDir = %q", got)
+	}
+	if got := harnessPackageDir(dshPath, "@deepseek-ai/not-shipped"); got != "" {
+		t.Fatalf("a package the harness does not ship must not resolve: %q", got)
+	}
+	if got := harnessPackageRoot(filepath.Join(t.TempDir(), "bin", "dsh")); got != "" {
+		t.Fatalf("a dsh outside any install must not resolve: %q", got)
+	}
+}
+
+// A second copy of a harness package is a second module identity, and DSH keys
+// its scheduler by symbol: the copy is what made every web tool call fail with
+// "Cannot read properties of undefined (reading 'prepare')".
+func TestLinkHarnessPackagesReplacesCopies(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("DSH_HOME", home)
+	dshPath := fakeHarness(t, "@deepseek-ai/dsh-tools", "@deepseek-ai/cosmokit")
+
+	modules := filepath.Join(home, "profiles", "dsh-piko", "node_modules")
+	copyDir := filepath.Join(modules, "@deepseek-ai", "dsh-tools")
+	if err := os.MkdirAll(copyDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(copyDir, "package.json"), []byte(`{"name":"@deepseek-ai/dsh-tools","version":"0.1.5-rc.1"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A package the harness does not ship must be left alone.
+	ownDir := filepath.Join(modules, "@deepseek-ai", "dsh-plugin-something")
+	if err := os.MkdirAll(ownDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := `{"dependencies":{"@deepseek-ai/dsh-tools":"^0.1.5-rc.1","dsh-plugin-piko-remote":"file:./x.tgz"}}`
+	profileDir := filepath.Join(home, "profiles", "dsh-piko")
+	if err := os.WriteFile(filepath.Join(profileDir, "package.json"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := linkHarnessPackages(testLogger(), dshPath, "dsh-piko"); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Lstat(copyDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("the copy should have been replaced by a symlink, mode = %v", info.Mode())
+	}
+	if !resolvesTo(copyDir, harnessPackageDir(dshPath, "@deepseek-ai/dsh-tools")) {
+		t.Fatal("the symlink should point at the harness copy")
+	}
+
+	raw, err := os.ReadFile(filepath.Join(profileDir, "package.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	dependencies := parsed["dependencies"].(map[string]any)
+	if got := dependencies["@deepseek-ai/dsh-tools"]; got != "link:"+harnessPackageDir(dshPath, "@deepseek-ai/dsh-tools") {
+		t.Fatalf("manifest spec = %v, want a link: spec so pnpm keeps the symlink", got)
+	}
+	if got := dependencies["dsh-plugin-piko-remote"]; got != "file:./x.tgz" {
+		t.Fatalf("unrelated dependencies must survive the rewrite: %v", got)
+	}
+
+	// Idempotent: a second pass leaves the linked tree untouched.
+	runner := &fakeRunner{}
+	if err := linkHarnessPackages(testLogger(), dshPath, "dsh-piko"); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatal("the repair pass must not shell out")
+	}
+	if !resolvesTo(copyDir, harnessPackageDir(dshPath, "@deepseek-ai/dsh-tools")) {
+		t.Fatal("a second pass must keep the link")
+	}
+}
+
+func TestSatisfyPeersLinksHarnessPackages(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("DSH_HOME", home)
+	dshPath := fakeHarness(t, "@deepseek-ai/dsh-tools")
+
+	modules := filepath.Join(home, "profiles", "dsh-piko", "node_modules")
+	pluginDir := filepath.Join(modules, pikoRemotePackage)
+	if err := os.MkdirAll(pluginDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := `{"name":"dsh-plugin-piko-remote","peerDependencies":{"@deepseek-ai/dsh-tools":"^0.1.5-rc.1"}}`
+	if err := os.WriteFile(filepath.Join(pluginDir, "package.json"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &fakeRunner{}
+	if err := satisfyPeers(context.Background(), testLogger(), runner, dshPath, "dsh-piko", []string{pikoRemotePackage}); err != nil {
+		t.Fatal(err)
+	}
+	want := "add link:" + harnessPackageDir(dshPath, "@deepseek-ai/dsh-tools")
+	if !runner.ran(want) {
+		t.Fatalf("a harness-shipped peer must be linked, not installed: %v", runner.calls)
+	}
+}
+
+func TestApplyNoSandbox(t *testing.T) {
+	base := []string{"PATH=/usr/bin"}
+
+	if got := applyNoSandbox(testLogger(), nil, base, false); len(got) != 0 {
+		t.Fatalf("a default launch must not touch the child environment: %v", got)
+	}
+
+	got := applyNoSandbox(testLogger(), nil, base, true)
+	if len(got) != 1 || got[0] != "DSH_PERMISSION_MODE=danger-full-access" {
+		t.Fatalf("--no-sandbox should pin the default mode: %v", got)
+	}
+
+	// An explicit choice wins, wherever it was made: inherited from the
+	// launcher's own environment, or handed to the child with --env.
+	inherited := applyNoSandbox(testLogger(), nil, []string{"PATH=/usr/bin", "DSH_PERMISSION_MODE=workspace-write"}, true)
+	if len(inherited) != 0 {
+		t.Fatalf("an inherited mode must win: %v", inherited)
+	}
+	explicit := applyNoSandbox(testLogger(), []string{"DSH_PERMISSION_MODE=read-only"}, base, true)
+	if len(explicit) != 1 || explicit[0] != "DSH_PERMISSION_MODE=read-only" {
+		t.Fatalf("an --env mode must survive untouched: %v", explicit)
+	}
+}
+
+func TestHasEnvEntry(t *testing.T) {
+	env := []string{"PATH=/usr/bin", "DSH_PERMISSION_MODE=read-only"}
+	if !hasEnvEntry(env, "DSH_PERMISSION_MODE") {
+		t.Fatal("expected the entry to be found")
+	}
+	if hasEnvEntry(env, "DSH_PERMISSION") {
+		t.Fatal("a prefix of a key is not the key")
+	}
+	if hasEnvEntry(env, "DEEPSEEK_API_KEY") {
+		t.Fatal("unexpected hit")
+	}
+}
+
+func TestEnsureToken(t *testing.T) {
+	if got := ensureToken("https://x.example/", "abc"); got != "https://x.example/?token=abc" {
+		t.Fatalf("got %q", got)
+	}
+	if got := ensureToken("https://x.example/?a=1", "abc"); got != "https://x.example/?a=1&token=abc" {
+		t.Fatalf("got %q", got)
+	}
+	if got := ensureToken("https://x.example/?token=abc", "abc"); got != "https://x.example/?token=abc" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestWaitReadyReportsTunnelNote(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "dsh.log")
+	body := "dsh web: http://127.0.0.1:3080/?token=tok\n! [piko-remote] autoExpose failed: connection refused\n"
+	if err := os.WriteFile(logPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	state := &runState{PID: os.Getpid(), LogFile: logPath}
+	if err := waitReady(context.Background(), testLogger(), state, true, 5*time.Second); err != nil {
+		t.Fatalf("waitReady: %v", err)
+	}
+	if state.LocalURL == "" || state.Token != "tok" {
+		t.Fatalf("local URL/token not captured: %+v", state)
+	}
+	if !strings.Contains(state.TunnelNote, "connection refused") {
+		t.Fatalf("tunnel note = %q", state.TunnelNote)
+	}
+}
+
+func TestWaitReadyAcceptsAFreshAccessRecord(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "dsh.log")
+	accessPath := filepath.Join(dir, "access.json")
+	if err := os.WriteFile(logPath, []byte("dsh web: http://127.0.0.1:41587/?token=tok\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	record := accessRecord{
+		Endpoint:  "dsh-kyd4h7",
+		RemoteURL: "https://dsh-kyd4h7.clauded.friddle.me/",
+		AuthUser:  "friddle",
+		AuthPass:  "sybran_20250807",
+		WrittenAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	body, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(accessPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	state := &runState{PID: os.Getpid(), LogFile: logPath, AccessFile: accessPath}
+	if err := waitReady(context.Background(), testLogger(), state, true, 5*time.Second); err != nil {
+		t.Fatalf("waitReady: %v", err)
+	}
+	if state.RemoteURL != record.RemoteURL || state.AuthUser != "friddle" {
+		t.Fatalf("fresh record not adopted: %+v", state)
+	}
+}
+
+func TestWaitReadyIgnoresStaleAccessRecord(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "dsh.log")
+	accessPath := filepath.Join(dir, "access.json")
+	if err := os.WriteFile(logPath, []byte("dsh web: http://127.0.0.1:41587/?token=tok\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stale := accessRecord{
+		Endpoint:  "dsh-oldendp",
+		RemoteURL: "https://dsh-oldendp.clauded.friddle.me/",
+		AuthUser:  "someoneelse",
+		WrittenAt: "2020-01-01T00:00:00Z",
+	}
+	body, err := json.Marshal(stale)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(accessPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	state := &runState{PID: os.Getpid(), LogFile: logPath, AccessFile: accessPath}
+	if err := waitReady(context.Background(), testLogger(), state, true, 300*time.Millisecond); err != nil {
+		t.Fatalf("waitReady: %v", err)
+	}
+	if state.RemoteURL != "" {
+		t.Fatalf("a record from an earlier run must not be reported as this run's tunnel: %+v", state)
+	}
+	if !strings.Contains(state.TunnelNote, "timed out") {
+		t.Fatalf("expected a timeout note, got %q", state.TunnelNote)
+	}
+}
+
+func TestWaitReadyTimesOutWithoutWebLine(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "dsh.log")
+	if err := os.WriteFile(logPath, []byte("starting up\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state := &runState{PID: os.Getpid(), LogFile: logPath}
+	err := waitReady(context.Background(), testLogger(), state, false, 300*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("expected a timeout error, got %v", err)
+	}
+}
+
+func TestEnsureHelperBinaryPlantsEmbeddedHelper(t *testing.T) {
+	name, err := helperFileName()
+	if err != nil {
+		t.Skipf("no helper name for this platform: %v", err)
+	}
+	if _, _, err := helperBinaries(name); err != nil {
+		t.Skipf("this build carries no helper to plant: %v", err)
+	}
+
+	home := t.TempDir()
+	t.Setenv("DSH_HOME", home)
+	packageDir := filepath.Join(home, "profiles", "dsh-piko", "node_modules", pikoRemotePackage)
+	if err := os.MkdirAll(packageDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ensureHelperBinary(testLogger(), "dsh-piko", pikoRemotePackage); err != nil {
+		t.Fatalf("ensureHelperBinary: %v", err)
+	}
+
+	target := filepath.Join(packageDir, "bin", name)
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("helper not planted: %v", err)
+	}
+	if info.Size() == 0 {
+		t.Fatal("planted helper is empty")
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("planted helper is not executable: %v", info.Mode())
+	}
+}
+
+func TestExtractTarGzStripsTopLevelDirectory(t *testing.T) {
+	// A real Node tarball wraps everything in `node-vX-os-arch/`; extraction
+	// strips exactly that, which is why the caller must extract into a
+	// version-named directory rather than straight into the install root.
+	var buffer bytes.Buffer
+	gzipWriter := gzip.NewWriter(&buffer)
+	tarWriter := tar.NewWriter(gzipWriter)
+
+	files := map[string]string{
+		"node-v1-linux-x64/bin/node":    "#!/bin/sh\necho v1\n",
+		"node-v1-linux-x64/README.md":   "readme",
+		"node-v1-linux-x64/lib/node.js": "// lib",
+	}
+	for name, body := range files {
+		if err := tarWriter.WriteHeader(&tar.Header{
+			Name: name, Mode: 0o755, Size: int64(len(body)), Typeflag: tar.TypeReg,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tarWriter.Write([]byte(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tarWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gzipWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dest := t.TempDir()
+	if err := extractTarGz(bytes.NewReader(buffer.Bytes()), dest); err != nil {
+		t.Fatalf("extractTarGz: %v", err)
+	}
+	for _, want := range []string{"bin/node", "README.md", "lib/node.js"} {
+		if _, err := os.Stat(filepath.Join(dest, filepath.FromSlash(want))); err != nil {
+			t.Errorf("expected %s in the extraction root: %v", want, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dest, "node-v1-linux-x64")); !os.IsNotExist(err) {
+		t.Error("the top-level directory should have been stripped")
+	}
+}
+
+func contains(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestStripTopLevelAndSafeJoin(t *testing.T) {
@@ -481,199 +864,4 @@ func TestSatisfyPeersInstallsMissingPeer(t *testing.T) {
 	if len(runner.calls) != 0 {
 		t.Fatalf("a satisfied peer must not be reinstalled: %v", runner.calls)
 	}
-}
-
-func TestEnsureToken(t *testing.T) {
-	if got := ensureToken("https://x.example/", "abc"); got != "https://x.example/?token=abc" {
-		t.Fatalf("got %q", got)
-	}
-	if got := ensureToken("https://x.example/?a=1", "abc"); got != "https://x.example/?a=1&token=abc" {
-		t.Fatalf("got %q", got)
-	}
-	if got := ensureToken("https://x.example/?token=abc", "abc"); got != "https://x.example/?token=abc" {
-		t.Fatalf("got %q", got)
-	}
-}
-
-func TestWaitReadyReportsTunnelNote(t *testing.T) {
-	dir := t.TempDir()
-	logPath := filepath.Join(dir, "dsh.log")
-	body := "dsh web: http://127.0.0.1:3080/?token=tok\n! [piko-remote] autoExpose failed: connection refused\n"
-	if err := os.WriteFile(logPath, []byte(body), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	state := &runState{PID: os.Getpid(), LogFile: logPath}
-	if err := waitReady(context.Background(), testLogger(), state, true, 5*time.Second); err != nil {
-		t.Fatalf("waitReady: %v", err)
-	}
-	if state.LocalURL == "" || state.Token != "tok" {
-		t.Fatalf("local URL/token not captured: %+v", state)
-	}
-	if !strings.Contains(state.TunnelNote, "connection refused") {
-		t.Fatalf("tunnel note = %q", state.TunnelNote)
-	}
-}
-
-func TestWaitReadyAcceptsAFreshAccessRecord(t *testing.T) {
-	dir := t.TempDir()
-	logPath := filepath.Join(dir, "dsh.log")
-	accessPath := filepath.Join(dir, "access.json")
-	if err := os.WriteFile(logPath, []byte("dsh web: http://127.0.0.1:41587/?token=tok\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	record := accessRecord{
-		Endpoint:  "dsh-kyd4h7",
-		RemoteURL: "https://dsh-kyd4h7.clauded.friddle.me/",
-		AuthUser:  "friddle",
-		AuthPass:  "sybran_20250807",
-		WrittenAt: time.Now().UTC().Format(time.RFC3339),
-	}
-	body, err := json.Marshal(record)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(accessPath, body, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	state := &runState{PID: os.Getpid(), LogFile: logPath, AccessFile: accessPath}
-	if err := waitReady(context.Background(), testLogger(), state, true, 5*time.Second); err != nil {
-		t.Fatalf("waitReady: %v", err)
-	}
-	if state.RemoteURL != record.RemoteURL || state.AuthUser != "friddle" {
-		t.Fatalf("fresh record not adopted: %+v", state)
-	}
-}
-
-func TestWaitReadyIgnoresStaleAccessRecord(t *testing.T) {
-	dir := t.TempDir()
-	logPath := filepath.Join(dir, "dsh.log")
-	accessPath := filepath.Join(dir, "access.json")
-	if err := os.WriteFile(logPath, []byte("dsh web: http://127.0.0.1:41587/?token=tok\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	stale := accessRecord{
-		Endpoint:  "dsh-oldendp",
-		RemoteURL: "https://dsh-oldendp.clauded.friddle.me/",
-		AuthUser:  "someoneelse",
-		WrittenAt: "2020-01-01T00:00:00Z",
-	}
-	body, err := json.Marshal(stale)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(accessPath, body, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	state := &runState{PID: os.Getpid(), LogFile: logPath, AccessFile: accessPath}
-	if err := waitReady(context.Background(), testLogger(), state, true, 300*time.Millisecond); err != nil {
-		t.Fatalf("waitReady: %v", err)
-	}
-	if state.RemoteURL != "" {
-		t.Fatalf("a record from an earlier run must not be reported as this run's tunnel: %+v", state)
-	}
-	if !strings.Contains(state.TunnelNote, "timed out") {
-		t.Fatalf("expected a timeout note, got %q", state.TunnelNote)
-	}
-}
-
-func TestWaitReadyTimesOutWithoutWebLine(t *testing.T) {
-	dir := t.TempDir()
-	logPath := filepath.Join(dir, "dsh.log")
-	if err := os.WriteFile(logPath, []byte("starting up\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	state := &runState{PID: os.Getpid(), LogFile: logPath}
-	err := waitReady(context.Background(), testLogger(), state, false, 300*time.Millisecond)
-	if err == nil || !strings.Contains(err.Error(), "timed out") {
-		t.Fatalf("expected a timeout error, got %v", err)
-	}
-}
-
-func TestEnsureHelperBinaryPlantsEmbeddedHelper(t *testing.T) {
-	name, err := helperFileName()
-	if err != nil {
-		t.Skipf("no helper name for this platform: %v", err)
-	}
-	if _, _, err := helperBinaries(name); err != nil {
-		t.Skipf("this build carries no helper to plant: %v", err)
-	}
-
-	home := t.TempDir()
-	t.Setenv("DSH_HOME", home)
-	packageDir := filepath.Join(home, "profiles", "dsh-piko", "node_modules", pikoRemotePackage)
-	if err := os.MkdirAll(packageDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := ensureHelperBinary(testLogger(), "dsh-piko", pikoRemotePackage); err != nil {
-		t.Fatalf("ensureHelperBinary: %v", err)
-	}
-
-	target := filepath.Join(packageDir, "bin", name)
-	info, err := os.Stat(target)
-	if err != nil {
-		t.Fatalf("helper not planted: %v", err)
-	}
-	if info.Size() == 0 {
-		t.Fatal("planted helper is empty")
-	}
-	if info.Mode().Perm()&0o111 == 0 {
-		t.Fatalf("planted helper is not executable: %v", info.Mode())
-	}
-}
-
-func TestExtractTarGzStripsTopLevelDirectory(t *testing.T) {
-	// A real Node tarball wraps everything in `node-vX-os-arch/`; extraction
-	// strips exactly that, which is why the caller must extract into a
-	// version-named directory rather than straight into the install root.
-	var buffer bytes.Buffer
-	gzipWriter := gzip.NewWriter(&buffer)
-	tarWriter := tar.NewWriter(gzipWriter)
-
-	files := map[string]string{
-		"node-v1-linux-x64/bin/node":    "#!/bin/sh\necho v1\n",
-		"node-v1-linux-x64/README.md":   "readme",
-		"node-v1-linux-x64/lib/node.js": "// lib",
-	}
-	for name, body := range files {
-		if err := tarWriter.WriteHeader(&tar.Header{
-			Name: name, Mode: 0o755, Size: int64(len(body)), Typeflag: tar.TypeReg,
-		}); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := tarWriter.Write([]byte(body)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := tarWriter.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := gzipWriter.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	dest := t.TempDir()
-	if err := extractTarGz(bytes.NewReader(buffer.Bytes()), dest); err != nil {
-		t.Fatalf("extractTarGz: %v", err)
-	}
-	for _, want := range []string{"bin/node", "README.md", "lib/node.js"} {
-		if _, err := os.Stat(filepath.Join(dest, filepath.FromSlash(want))); err != nil {
-			t.Errorf("expected %s in the extraction root: %v", want, err)
-		}
-	}
-	if _, err := os.Stat(filepath.Join(dest, "node-v1-linux-x64")); !os.IsNotExist(err) {
-		t.Error("the top-level directory should have been stripped")
-	}
-}
-
-func contains(items []string, want string) bool {
-	for _, item := range items {
-		if item == want {
-			return true
-		}
-	}
-	return false
 }

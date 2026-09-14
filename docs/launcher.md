@@ -19,8 +19,13 @@ dsh-piko-remote up --plugin friddle/dsh-plugin-piko-remote
    —— 从自带的 web 模板初始化，但不启动。默认 profile 名是 `dsh-piko`。
 4. **装插件**：`dsh plugin add`，支持多种写法（见下）。
 5. **补齐 peerDependency**：读插件 `package.json`，把 profile 里解析不到的
-   `@deepseek-ai/*` peer 装上（profile 默认 `autoInstallPeers: false`，
-   不补的话插件会以 `ERR_MODULE_NOT_FOUND` 加载失败）。
+   `@deepseek-ai/*` peer 补上（profile 默认 `autoInstallPeers: false`，
+   不补的话插件会以 `ERR_MODULE_NOT_FOUND` 加载失败）。补的方式是
+   **软链到 dsh 自带的那一份**（依赖写回 `link:<dsh>/node_modules/@deepseek-ai/...`），
+   不是从 npm 另装一份——同一个 harness 包出现两份物理拷贝会让它的 `Symbol()`
+   跨模块身份失效，工具调用会死在
+   `Cannot read properties of undefined (reading 'prepare')`。装完还会再扫一遍
+   profile，把历史遗留的副本一并换成链接（幂等，可反复 `up`）。
 6. **补 helper 二进制**：从 GitHub/npm 装的插件不带 `bin/`（二进制是构建产物），
    启动器把自己内嵌的 `piko-expose` 写进插件的 `bin/` 并 `chmod +x`。
 7. **写隧道配置**：不修改你自己的 `cordis.patch.yml`，而是生成一份 overlay，
@@ -82,7 +87,18 @@ dsh-piko-remote up --json                # 给脚本用：stdout 只有一行 JS
 | `--dsh-home DIR` | `$DSH_HOME` 或 `~/.dsh` | DSH home |
 | `--registry URL` | 用户 npm 配置 | 安装时用的 registry |
 | `--timeout SECONDS` | `180` | 等待启动的超时 |
+| `--no-sandbox` | `false` | 新会话默认用 `danger-full-access`：命令不加沙箱包装、审批也关掉。等价于 `--env DSH_PERMISSION_MODE=danger-full-access`；调用方自己指定了 `DSH_PERMISSION_MODE` 时不覆盖（只 warn） |
 | `--force` | `false` | 强制重装 node 与 dsh |
+
+## 沙箱开关
+
+启动器不替换执行器插件，只改**默认策略模式**（`DSH_PERMISSION_MODE`）：宿主组合里
+唯一的 bash 执行器 `@deepseek-ai/dsh-bash-sandbox` 在 `danger-full-access` 下会直接
+交给本地执行器，等于「不走沙箱」。为什么不能干脆换成
+`@deepseek-ai/dsh-bash-local`：`permission` 预设插件会拒绝没有 `sandboxMode` 的执行器，
+而 `fs-sandbox` / `api-workspace-files` / deliverables 界面都注入 `sandboxPolicy`。
+各层控制点、以及宿主需要什么能力（`bwrap` 的 PID namespace + `/proc`，或启用了
+`landlock` 的 LSM）见 [README 的「沙箱与权限」](../README.md#沙箱与权限命令到底怎么跑)。
 
 ## 安全
 

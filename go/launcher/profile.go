@@ -131,12 +131,16 @@ func installPlugins(ctx context.Context, log *logger, runner commandRunner, dshP
 	return installed, nil
 }
 
-// satisfyPeers installs any unresolvable DSH peer dependency of the given
+// satisfyPeers provides any unresolvable DSH peer dependency of the given
 // packages.
 //
 // This is not theoretical: the profile ships with `autoInstallPeers: false`, so
 // a plugin that imports `@deepseek-ai/dsh-tools` fails to load with
-// ERR_MODULE_NOT_FOUND until that peer is installed explicitly.
+// ERR_MODULE_NOT_FOUND until that peer is present.
+//
+// A peer the harness itself ships is linked, never installed: see
+// linkHarnessPackages for why a second copy of a harness package is a
+// correctness bug rather than a versioning preference.
 func satisfyPeers(ctx context.Context, log *logger, runner commandRunner, dshPath, profile string, packages []string) error {
 	home, err := dshHome()
 	if err != nil {
@@ -161,14 +165,189 @@ func satisfyPeers(ctx context.Context, log *logger, runner commandRunner, dshPat
 			if _, err := os.Stat(filepath.Join(modules, filepath.FromSlash(peer))); err == nil {
 				continue
 			}
-			log.info("installing missing peer %s@%s required by %s", peer, constraint, pkg)
 			spec := peer + "@" + strings.TrimPrefix(constraint, "npm:")
+			if shipped := harnessPackageDir(dshPath, peer); shipped != "" {
+				spec = "link:" + shipped
+				log.info("linking peer %s required by %s to the copy shipped inside dsh", peer, pkg)
+			} else {
+				log.info("installing missing peer %s@%s required by %s", peer, constraint, pkg)
+			}
 			if _, err := runner.run(ctx, log, dshPath, "plugin", "--profile", profile, "add", spec); err != nil {
 				// Not fatal: the plugin may not need that peer at runtime, and
 				// its own load error is the better diagnostic.
-				log.warn("could not install peer %s: %v", spec, err)
+				log.warn("could not provide peer %s: %v", spec, err)
 			}
 		}
+	}
+	return nil
+}
+
+// dshPackageName is the harness package itself, used to walk a `bin/dsh` entry
+// back to the install that owns it.
+const dshPackageName = "@deepseek-ai/dsh"
+
+// harnessPackageRoot resolves the install directory of the dsh package behind
+// dshPath, or "" when it cannot be identified.
+//
+// Both layouts the launcher produces are covered: a `bin/dsh` that lives inside
+// the package (so EvalSymlinks walks into it), and the npm global prefix shape
+// where the package sits at <prefix>/lib/node_modules/@deepseek-ai/dsh.
+func harnessPackageRoot(dshPath string) string {
+	starts := make([]string, 0, 2)
+	if resolved, err := filepath.EvalSymlinks(dshPath); err == nil {
+		starts = append(starts, filepath.Dir(resolved))
+	}
+	starts = append(starts, filepath.Dir(dshPath))
+
+	for _, start := range starts {
+		dir := start
+		for depth := 0; depth < 8; depth++ {
+			if readPackageName(filepath.Join(dir, "package.json")) == dshPackageName {
+				return dir
+			}
+			for _, candidate := range []string{
+				filepath.Join(dir, "lib", "node_modules", "@deepseek-ai", "dsh"),
+				filepath.Join(dir, "node_modules", "@deepseek-ai", "dsh"),
+			} {
+				if readPackageName(filepath.Join(candidate, "package.json")) == dshPackageName {
+					return candidate
+				}
+			}
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			dir = parent
+		}
+	}
+	return ""
+}
+
+// harnessPackageDir is the harness's own copy of pkg, or "" when the harness
+// does not ship it.
+func harnessPackageDir(dshPath, pkg string) string {
+	root := harnessPackageRoot(dshPath)
+	if root == "" {
+		return ""
+	}
+	dir := filepath.Join(root, "node_modules", filepath.FromSlash(pkg))
+	if info, err := os.Stat(dir); err == nil && info.IsDir() {
+		return dir
+	}
+	return ""
+}
+
+// readPackageName returns the "name" field of a package.json, or "" when the
+// file is missing or unreadable.
+func readPackageName(path string) string {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var manifest struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return ""
+	}
+	return manifest.Name
+}
+
+// resolvesTo reports whether path already resolves to the same directory as
+// target.
+func resolvesTo(path, target string) bool {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return false
+	}
+	expected, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		return false
+	}
+	return resolved == expected
+}
+
+// setProfileDependency rewrites one dependency spec in the profile manifest,
+// preserving every other field.
+func setProfileDependency(profile, pkg, spec string) error {
+	home, err := dshHome()
+	if err != nil {
+		return err
+	}
+	manifestPath := filepath.Join(profilePath(home, profile), "package.json")
+	raw, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return err
+	}
+	var manifest map[string]any
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return fmt.Errorf("parse profile package.json: %w", err)
+	}
+	dependencies, _ := manifest["dependencies"].(map[string]any)
+	if dependencies == nil {
+		dependencies = map[string]any{}
+	}
+	dependencies[pkg] = spec
+	manifest["dependencies"] = dependencies
+	body, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(manifestPath, append(body, '\n'), 0o644)
+}
+
+// linkHarnessPackages replaces profile copies of packages the harness itself
+// ships with symlinks to the harness's copies.
+//
+// This is a correctness requirement, not housekeeping. Harness packages pass
+// values across module boundaries by symbol: `@deepseek-ai/dsh-tools` hands the
+// agent loop a `Symbol()` key for its execution scheduler. Node keys module
+// identity by resolved path, so a second copy of that package in the profile is
+// a second symbol — the agent loop then reads an undefined scheduler and every
+// tool call fails with `Cannot read properties of undefined (reading
+// 'prepare')`. Linking keeps one physical copy, and therefore one symbol, per
+// package for the whole process.
+//
+// The pass also repairs profiles an earlier launcher left with copies, which is
+// why it scans the installed tree instead of trusting the dependency list.
+func linkHarnessPackages(log *logger, dshPath, profile string) error {
+	root := harnessPackageRoot(dshPath)
+	if root == "" {
+		log.warn("cannot locate the dsh install behind %s; leaving profile copies of harness packages in place", dshPath)
+		return nil
+	}
+	home, err := dshHome()
+	if err != nil {
+		return err
+	}
+	scope := filepath.Join(profilePath(home, profile), "node_modules", "@deepseek-ai")
+	entries, err := os.ReadDir(scope)
+	if err != nil {
+		return nil // no scoped dependencies in this profile
+	}
+
+	for _, entry := range entries {
+		name := entry.Name()
+		source := filepath.Join(root, "node_modules", "@deepseek-ai", name)
+		if info, err := os.Stat(source); err != nil || !info.IsDir() {
+			continue
+		}
+		target := filepath.Join(scope, name)
+		if resolvesTo(target, source) {
+			continue
+		}
+		if err := os.RemoveAll(target); err != nil {
+			return fmt.Errorf("remove duplicate %s: %w", name, err)
+		}
+		if err := os.Symlink(source, target); err != nil {
+			return fmt.Errorf("link %s: %w", name, err)
+		}
+		pkg := "@deepseek-ai/" + name
+		if err := setProfileDependency(profile, pkg, "link:"+source); err != nil {
+			log.warn("linked %s but could not rewrite the profile manifest: %v", pkg, err)
+			continue
+		}
+		log.info("linked %s to the copy shipped inside dsh", pkg)
 	}
 	return nil
 }
