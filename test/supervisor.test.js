@@ -193,6 +193,21 @@ describe('TunnelSupervisor.expose', () => {
     assert.ok(tunnel.expiresAt !== undefined, 'a 60 minute TTL should produce an expiry')
   })
 
+  it('honours the configured endpoint when the caller names none', async () => {
+    // `--endpoint` reaches the plugin as config, and auto-expose never passes a
+    // name: the configured value has to be the fallback, or a pinned URL is
+    // impossible and every boot publishes a new one.
+    const { supervisor, specs } = makeSupervisor({ readyTimeoutMs: 20 }, { endpoint: 'dsh-browser' })
+    await assert.rejects(() => supervisor.expose({ port: 8080 }), /did not report ready within 20ms/)
+    assert.equal(specs[0].argv[specs[0].argv.indexOf('--endpoint') + 1], 'dsh-browser')
+  })
+
+  it('lets an explicit name win over the configured endpoint', async () => {
+    const { supervisor, specs } = makeSupervisor({ readyTimeoutMs: 20 }, { endpoint: 'dsh-browser' })
+    await assert.rejects(() => supervisor.expose({ port: 8080, name: 'dsh-other' }), /did not report ready within 20ms/)
+    assert.equal(specs[0].argv[specs[0].argv.indexOf('--endpoint') + 1], 'dsh-other')
+  })
+
   it('defaults to the DSH web port when no port is given', async () => {
     const { supervisor, specs } = makeSupervisor()
     const pending = supervisor.expose()
