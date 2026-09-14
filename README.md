@@ -23,8 +23,9 @@
 可用。模型工具、子进程管理、隧道与鉴权均已实现，并通过真实公网链路验证：
 
 - `piko-expose`（`go/`）单跑即可连公共服务器，端到端冒烟脚本 3/3 通过。
-- 插件半侧（`lib/`）44 个单测 + Go 13 个单测通过。
-- 已在远程 Linux 主机上以 `dsh` + 本插件跑通 DSH Web 的公网访问。
+- 插件半侧（`lib/`）48 个单测 + Go 13 个单测通过。
+- 已在远程 Linux 主机上以 `dsh` + 本插件跑通 DSH Web 的公网访问：
+  SPA `200`、`/assets/*.js` `200`、`/api/remote.mux`（WebSocket）`101`。
 
 尚未做（见 [PLAN.md](./PLAN.md) Phase 6）：客户端设置卡片、settings 命名空间、
 release 时交叉编译并随包发布 helper。
@@ -111,6 +112,19 @@ endpoint，路径原样透传，`/api/...`、`/assets/...` 都正常。
 |---|---|---|
 | 保留 Host | `preserveHost: true` + `dsh --profile web --trusted-host <endpoint>.<base>` | `--trusted-host` 不支持通配符，endpoint 必须固定 |
 | 本地化 Host | `preserveHost: false` | 上游以为自己在 `127.0.0.1`，依赖 Host 的绝对跳转/cookie 可能不符合预期 |
+
+## 部署到远程主机
+
+在无图形界面的 Linux 主机上装 DSH、装本插件、把 Web 界面暴露到公网，完整命令见
+[docs/remote-deploy.md](./docs/remote-deploy.md)。三个要点：
+
+- helper 用 `npm pack` 出来的 **tarball** 安装：用目录安装会变成 `link:`，Node 会从插件的
+  真实路径解析裸 import，`schemastery` / `dsh-tools` 全都找不到；
+- `@deepseek-ai/dsh-tools` 是 peerDependency，而 profile 默认 `autoInstallPeers: false`，
+  需要单独 `dsh plugin add @deepseek-ai/dsh-tools@<版本>`；
+- DSH Web 自己还有一道 `?token=` 门（每次启动都变），所以完整地址是
+  `https://<endpoint>.<base>/?token=…`，外面再套一层本插件的 Basic Auth。
+  自动暴露（`autoExpose`）时用 `credentialsFile` 把地址与随机账号密码以 0600 权限落盘。
 
 ## 验证
 

@@ -5,6 +5,35 @@
 
 ---
 
+## 实现现状（2026-09-14）
+
+**已落地并端到端验证**（commit `ffd47c6`，插件 `0.2.0`）：
+
+| 部分 | 状态 | 证据 |
+|---|---|---|
+| Go helper `piko-expose` | ✅ | `go/`，13 个单测；`scripts/smoke-test.sh` 真实公网 3/3 |
+| 插件半侧（supervisor / endpoint / tools / config） | ✅ | `lib/`，48 个 node 单测 |
+| 三个模型工具 | ✅ | `remote_expose` / `remote_status` / `remote_close` |
+| 子域名模式端到端 | ✅ | `dsh-zi38kw.clauded.friddle.me`：SPA 200、`/assets/*.js` 200、`/api/remote.mux` **101** |
+| 远程部署链路 | ✅ | `docs/remote-deploy.md`（Ubuntu + `dsh@0.1.5-rc.1` + tarball 安装） |
+
+关键结论（覆盖下面调研里的推测）：
+
+1. **公共服务器不需要 upstream key**：直接连 `https://clauded.friddle.me` 即可。
+2. **`*.clauded.friddle.me` 泛域名 DNS + 泛域名证书已就绪**（证书 `CN=*.clauded.friddle.me`），
+   Phase 4/5 的最后一块基础设施已补齐。
+3. **DSH Web 必须走子域名模式**：已在源码中确认（`dsh-client-connection/lib/client.js`
+   用 `location.origin` 拼 API base），路径模式下 `/api/...` 会被当成另一个 endpoint。
+4. **Host 本地化可以替代 `--trusted-host`**：helper `--preserve-host=false` 会同时改写
+   Host/Origin/Referer，DSH 的 `Origin==Host` 围栏直接通过，因此 endpoint 不必固定。
+5. **helper 二进制不进 git**：`bin/` 被忽略；远程安装必须用 `npm pack` 出来的 tarball
+   （目录安装会变成 `link:`，裸 import 解析不到宿主包），见 `docs/remote-deploy.md`。
+
+**仍未做**（Phase 6）：客户端设置卡片、settings 命名空间注册、release 时交叉编译
+helper 并随包发布（目前靠 `scripts/build-helper.sh` + 手工分发）。
+
+---
+
 ## 0. 一句话目标
 
 在 DSH 里装一个插件，模型或用户说一句「把本地端口暴露出去」，
@@ -227,20 +256,25 @@ dsh-plugin-piko-remote/
 ```
 piko-expose \
   --remote      https://clauded.friddle.me \   # 默认，与 opencode-piko 的 DefaultRemote 一致
-  --endpoint    dsh-a1b2c3                   \   # 必填；[A-Za-z0-9_-]，非法字符直接拒绝
-  --target      127.0.0.1:43120              \   # 必填，本地被暴露端口
-  --strip-prefix /dsh-a1b2c3                 \   # 默认 = /<endpoint>；命中才剥离（条件剥离）
-  --upstream-key <token>                     \   # 可选，piko API key
-  --auth-user/-pass                          \   # 可选 Basic Auth（默认开、自动生成密码）
-  --preserve-host=false                      \   # false = 把上游 Host 改写为 target（过回环围栏）
+  --endpoint    dsh-a1b2c3                   \   # 必填；[a-z0-9-]，≤63（要当 DNS 标签），非法直接拒绝
+  --target      127.0.0.1:43120              \   # 必填；只写端口号时自动补 127.0.0.1:
+  --url-mode    subdomain                    \   # subdomain | path，只影响打印出来的 remoteUrl
+  --strip-prefix auto                        \   # auto：subdomain 不剥，path 剥 /<endpoint>；命中才剥离
+  --upstream-key <token>                     \   # 可选，piko API key（公共服务器不需要）
+  --auth / --auth=false                      \   # 默认开
+  --auth-user / --auth-pass                  \   # 默认都随机生成（20 位密码，去易混字符）
+  --preserve-host / --preserve-host=false    \   # 默认 true；false 表示同时改写 Host/Origin/Referer
   --auto-exit 0                              \   # 分钟；0 = 不自动退出
+  --local-addr 127.0.0.1:18081               \   # 调试：额外在本地起同样的 handler
+  --insecure                                 \   # 调试：跳过 piko 服务器证书校验
   --json                                         # stdout 输出机读事件
 ```
 
-stdout 协议（一行一个 JSON，供插件解析）：
+stdout 协议（一行一个 JSON，供插件解析；`auth` 在 `ready` **之前**，这样等到 ready
+的 supervisor 已经拿到账号密码）：
 ```json
-{"event":"ready","endpoint":"dsh-a1b2c3","target":"127.0.0.1:43120","remoteUrl":"https://clauded.friddle.me/dsh-a1b2c3/"}
-{"event":"auth","user":"piko","pass":"xxxxxxxx"}
+{"event":"auth","user":"yg8uncvn","pass":"YpSdimgdAgY9A9Xv7CZy"}
+{"event":"ready","endpoint":"dsh-zi38kw","target":"127.0.0.1:3080","remoteUrl":"https://dsh-zi38kw.clauded.friddle.me/","urlMode":"subdomain"}
 {"event":"closed","reason":"signal"}
 {"event":"error","message":"..."}
 ```
@@ -262,7 +296,10 @@ stdout 协议（一行一个 JSON，供插件解析）：
 `remote_expose` 的工具描述里必须写明：**暴露 DSH GUI = 把本机 Agent 控制权交给任何拿到该 URL 的人**，
 默认要求开启 Basic Auth，且默认 TTL 非空。
 
-### 4.3 settings 命名空间 `piko-remote`
+### 4.3 settings 命名空间 `piko-remote`（⏳ Phase 6）
+
+当前所有配置走 cordis row 的 `config`（见 README），**尚未**注册 `ctx.settings`
+命名空间，所以还没有「设置页可改」的入口。计划中的 namespace：
 
 ```yaml
 piko-remote:
@@ -283,49 +320,51 @@ piko-remote:
 
 ## 5. 分阶段任务
 
-### Phase 0 — 可行性验证（半天，先做这个）
-- [ ] 用最小 Go 程序（或 `piko agent` CLI）连 `https://clauded.friddle.me`，暴露一个静态目录，验证 `https://clauded.friddle.me/<ep>/` 能打开
-- [ ] 确认服务端是否要求 token；若要求，确定 token 从哪来（配置文件 / 环境变量 / 问用户）
-- [ ] 验证 WebSocket 透传（用一个 echo WS 或直接拿 DSH GUI 的 `/api/remote.mux` 试）
-- [ ] 记录 endpoint 命名冲突行为（重名会怎样：负载均衡 or 覆盖）
+### Phase 0 — 可行性验证 ✅
+- [x] 用 Go helper 连 `https://clauded.friddle.me`，暴露一个静态目录并验证公网可访问
+- [x] 确认服务端**不要求** token（`--upstream-key` 留空即可连通）
+- [x] 验证 WebSocket 透传：DSH `/api/remote.mux` 返回 `101 Switching Protocols`
+- [x] 记录 endpoint 行为：子域名模式下标签为 `[a-z0-9-]`；重名会被 piko 负载均衡（所以默认随机后缀）
 
-**出口标准**：拿到一条能用的 `remoteUrl`，并确定鉴权方式。
+**出口标准**：✅ 拿到可用 `remoteUrl`，鉴权方式 = 可选 Basic Auth + 子域名路由。
 
-### Phase 1 — Go helper
-- [ ] `go/piko-expose`：`main.go` + `tunnel.go` + `rewrite.go`
-- [ ] 条件剥离前缀 + Host 改写 + Basic Auth + TTL + JSON 事件
-- [ ] `scripts/build-helper.sh`：darwin/arm64、darwin/amd64、linux/amd64、linux/arm64、windows/amd64
-- [ ] 单元测试：prefix 剥离边界（`/ep`、`/ep/`、`/ep/x`、`/api/x` 不剥离）
+### Phase 1 — Go helper ✅
+- [x] `go/piko-expose`：`main.go` + `tunnel.go` + `rewrite.go`
+- [x] 条件剥离前缀 + Host/Origin/Referer 改写 + Basic Auth + TTL + JSON 事件
+- [x] `scripts/build-helper.sh`：darwin/arm64、darwin/amd64、linux/amd64、linux/arm64、windows/amd64
+- [x] 单元测试：prefix 剥离边界（`/ep`、`/ep/`、`/ep/x`、`/api/x` 不剥离、`/epx` 不剥离）
 
-**出口标准**：`piko-expose --target 127.0.0.1:8080 …` 单跑成功，Ctrl+C 能干净退出。
+**出口标准**：✅ `piko-expose --target 127.0.0.1:8080 …` 单跑成功，SIGTERM 干净退出。
 
-### Phase 2 — 插件骨架 + 安装链路（🚧 进行中）
+### Phase 2 — 插件骨架 + 安装链路 ✅
 - [x] `package.json`（`type: module`、`dsh.bundle.patch`、`exports`、`peerDependencies`）
 - [x] `cordis.patch.yml`（row id `piko-remote`）
-- [x] `lib/index.js`：`name` + `apply(ctx)`，加载时解析 `ctx.get('webServer').port` 作为自检
-- [ ] `scripts/dev-install.sh`：`dsh plugin add /abs/path`
-- [ ] 重启 DSH，在 设置 → 插件 → 插件列表 里看到 `piko-remote` 且为 active
+- [x] `lib/index.js`：`name` + `apply(ctx)`；可选服务走 `ctx.inject`（`subprocess` / `webServer`），
+      这样 headless profile 里插件仍能加载并说明它做不了什么
+- [~] `scripts/dev-install.sh`：未单独写；开发装法写在 `docs/remote-deploy.md`（含两个坑）
+- [x] 安装链路实测：远程 `dsh plugin --profile piko add <tarball>` 后插件激活
 
-**出口标准**：插件能被 DSH 加载且不报错，日志里能看到本地 web 端口——这是整条链路最容易踩坑的一步，先打通。
+**出口标准**：✅ 插件能被 DSH 加载且不报错，日志里能看到本地 web 端口。
 
 
-### Phase 3 — 隧道服务与工具
-- [ ] `lib/supervisor.js`：用 `ctx.subprocess` 启动 helper，解析 ready/auth 行，维护状态机（starting/running/failed/stopped），dispose 时 `terminate()`
-- [ ] `lib/endpoint.js`：`<prefix>-<base36 随机>` + sanitize
-- [ ] `remote_expose` / `remote_status` / `remote_close` 三个工具
-- [ ] 二进制定位策略：优先包内 `bin/`，缺失则报可执行的修复指引（不静默下载）
+### Phase 3 — 隧道服务与工具 ✅
+- [x] `lib/supervisor.js`：用 `ctx.subprocess` 启动 helper，解析 ready/auth 行，维护状态机（starting/running/failed/stopped），dispose 时 `terminate()` + `waitForExit()`
+- [x] `lib/endpoint.js`：`<prefix>-<base36 随机>` + sanitize（DNS 标签规则）
+- [x] `remote_expose` / `remote_status` / `remote_close` 三个工具
+- [x] 二进制定位策略：优先包内 `bin/`，缺失则报可执行的修复指引（不静默下载）
 
-**出口标准**：模型调用 `remote_expose(port=8000)`，拿到可用 URL，`remote_close` 能停掉且进程不残留。
+**出口标准**：✅ 模型调用 `remote_expose(port=8000)`，拿到可用 URL，`remote_close` 能停掉且进程不残留。
 
-### Phase 4 — DSH Web 暴露（旗舰场景）
+### Phase 4 — DSH Web 暴露（旗舰场景）✅
 - [x] 服务端侧：子域名模式（见 Phase 5）
-- [ ] Go helper 支持 `--strip-prefix` 条件剥离（子域名模式下路径本来就是根，不需要剥离；保留给路径模式）
-- [ ] `remote_expose()` 不带 `port` 时默认取 `ctx.get('webServer').port`
-- [ ] 用 `/health` + 静态资源验证；再用 `/api/remote.mux` 验证 WebSocket 能穿过去
-- [ ] 固定 endpoint 名（默认 `dsh`），因为 `--trusted-host` 不支持通配符
-- [ ] 默认必须开 Basic Auth，`allowDshUiExpose` 默认 false，需用户显式打开
+- [x] Go helper 支持 `--strip-prefix` 条件剥离（子域名模式下为空，保留给路径模式）
+- [x] `remote_expose()` 不带 `port` 时默认取 DSH web 端口（`ctx.inject(['webServer'])` 懒取）
+- [x] 用静态资源（`/assets/*.js` 200）与 `/api/remote.mux`（**101**）验证
+- [x] 走到 `preserveHost: false` 路线：helper 同时改写 Host/Origin/Referer，
+      `--trusted-host` 与固定 endpoint 都不再必要（endpoint 默认随机）
+- [x] 默认开 Basic Auth，`allowDshUiExpose` 默认 false，需用户显式打开
 
-**出口标准**：手机 4G 打开 `https://dsh.<base>/`，能正常对话、能收到流式输出。
+**出口标准**：✅ 远端浏览器打开 `https://dsh-zi38kw.clauded.friddle.me/?token=…` 能加载完整界面并建立流。
 
 
 ### Phase 5 — 服务端子域名模式 ✅ 已完成
@@ -335,7 +374,8 @@ piko-remote:
 - [x] `SUBDOMAIN_PRESERVE_HOST=false` 时同步本地化 `Origin`/`Referer`
 - [x] 端到端测试（真实反向代理 + 假 piko 端口）+ 解析单测 + config 单测
 - [x] 修复镜像流水线：补齐 `build-push` 目标、`packages: write`、QEMU、`server/**` 变更自动发镜像
-- [ ] **基础设施（用户自理）**：`*.clauded.friddle.me` 泛域名 DNS + 泛域名证书
+- [x] **基础设施**：`*.clauded.friddle.me` 泛域名 DNS + 泛域名证书（2026-09-14 实测生效，
+      证书 `CN=*.clauded.friddle.me`，直连 192.227.178.111）
 
 **代码已在 gotty-piko `main`（commit `9920b36`），镜像由 CI 自动发布为 `ghcr.io/friddle/gottyp-piko-server:latest`。**
 
