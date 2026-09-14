@@ -8,6 +8,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // proxyConfig is everything the forwarding half of piko-expose needs. The
@@ -87,9 +88,11 @@ func newHandler(cfg proxyConfig) (http.Handler, error) {
 				localizeRequest(pr, targetURL)
 			}
 		},
-		// -1 disables output buffering, so streamed responses (SSE, chunked
-		// agent output) reach the browser as they are produced.
-		FlushInterval: -1,
+		// A small flush interval keeps streamed responses (SSE, chunked agent
+		// output) prompt without flushing on every single write: over a
+		// long-RTT link, one flush per write turns a large streamed body into
+		// thousands of tiny writes and throughput collapses.
+		FlushInterval: 100 * time.Millisecond,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			http.Error(w, fmt.Sprintf("piko-expose: upstream error: %v", err), http.StatusBadGateway)
 		},
