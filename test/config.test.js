@@ -9,6 +9,8 @@ describe('resolveConfig', () => {
     assert.equal(config.remote, DEFAULTS.remote)
     assert.equal(config.endpointPrefix, 'dsh')
     assert.equal(config.basicAuth, true)
+    assert.equal(config.basicAuthUser, '')
+    assert.equal(config.basicAuthPass, '')
     assert.equal(config.urlMode, 'subdomain')
     assert.equal(config.preserveHost, true)
     assert.equal(config.allowDshUiExpose, false)
@@ -41,6 +43,12 @@ describe('resolveConfig', () => {
     assert.equal(config.upstreamKey, 'key-123')
     assert.equal(config.helperPath, '/opt/piko-expose')
     assert.equal(config.connectTimeoutMs, 5000)
+  })
+
+  it('keeps fixed tunnel credentials when configured', () => {
+    const config = resolveConfig({ basicAuthUser: 'friddle', basicAuthPass: 'sybran_20250807' })
+    assert.equal(config.basicAuthUser, 'friddle')
+    assert.equal(config.basicAuthPass, 'sybran_20250807')
   })
 
   it('drops a routing mode the server cannot serve', () => {

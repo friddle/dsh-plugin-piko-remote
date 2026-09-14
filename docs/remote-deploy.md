@@ -5,7 +5,7 @@
 地址与随机账号密码。
 
 验证环境：Ubuntu 24.04 + Node v24.19.0 + `@deepseek-ai/dsh@0.1.5-rc.1`，
-插件 `0.2.0`，piko 服务端 `https://clauded.friddle.me`（子域名模式）。
+插件 `0.3.0`，piko 服务端 `https://clauded.friddle.me`（子域名模式）。
 
 ## 0. 前置条件
 
@@ -50,8 +50,8 @@ ls ~/.dsh/profiles/piko
 ```bash
 cd ~/dsh-plugin-piko-remote
 scripts/build-helper.sh          # 需要 Go；或者把交叉编译好的 bin/ 放进来
-npm pack                         # 生成 dsh-plugin-piko-remote-0.2.0.tgz（含 bin/）
-dsh plugin --profile piko add ~/dsh-plugin-piko-remote/dsh-plugin-piko-remote-0.2.0.tgz
+npm pack                         # 生成 dsh-plugin-piko-remote-0.3.0.tgz（含 bin/）
+dsh plugin --profile piko add ~/dsh-plugin-piko-remote/dsh-plugin-piko-remote-0.3.0.tgz
 dsh plugin --profile piko add @deepseek-ai/dsh-tools@0.1.5-rc.1
 ```
 

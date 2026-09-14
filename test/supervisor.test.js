@@ -119,6 +119,24 @@ describe('buildHelperArgv', () => {
     assert.ok(!argv.includes('--auto-exit'), 'a zero TTL must not schedule an exit')
   })
 
+  it('passes fixed Basic Auth credentials when configured', () => {
+    const argv = buildHelperArgv({ ...base, authUser: 'friddle', authPass: 'sybran_20250807' })
+    assert.equal(argv[argv.indexOf('--auth-user') + 1], 'friddle')
+    assert.equal(argv[argv.indexOf('--auth-pass') + 1], 'sybran_20250807')
+  })
+
+  it('omits empty credentials so the helper keeps generating its own', () => {
+    const argv = buildHelperArgv({ ...base, authUser: '', authPass: '' })
+    assert.ok(!argv.includes('--auth-user'), 'an empty user must not become an empty flag')
+    assert.ok(!argv.includes('--auth-pass'))
+  })
+
+  it('ignores fixed credentials when auth is disabled', () => {
+    const argv = buildHelperArgv({ ...base, basicAuth: false, authUser: 'u', authPass: 'p' })
+    assert.ok(!argv.includes('--auth-user'))
+    assert.ok(!argv.includes('--auth-pass'))
+  })
+
   it('forwards an upstream key only when one is set', () => {
     assert.ok(!buildHelperArgv(base).includes('--upstream-key'))
     const argv = buildHelperArgv({ ...base, upstreamKey: 'secret-key' })
@@ -246,6 +264,16 @@ describe('TunnelSupervisor.expose', () => {
     const second = await supervisor.expose({ port: 8080, name: 'dsh-my-app' })
     assert.deepEqual(second, first)
     assert.equal(handles.length, 1, 'a repeat request must not spawn a second helper')
+  })
+
+  it('uses configured fixed credentials for the tunnel', async () => {
+    const { supervisor, specs } = makeSupervisor({}, { basicAuthUser: 'friddle', basicAuthPass: 'sybran_20250807' })
+    const pending = supervisor.expose({ port: 8080 })
+    await tick()
+    assert.equal(specs[0].argv[specs[0].argv.indexOf('--auth-user') + 1], 'friddle')
+    assert.equal(specs[0].argv[specs[0].argv.indexOf('--auth-pass') + 1], 'sybran_20250807')
+    await supervisor.dispose()
+    await pending.catch(() => {})
   })
 
   it('honours auth being turned off for one tunnel', async () => {

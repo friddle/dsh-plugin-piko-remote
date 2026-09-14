@@ -281,6 +281,8 @@ type overlayConfig struct {
 	Remote            string `yaml:"remote"`
 	EndpointPrefix    string `yaml:"endpointPrefix"`
 	BasicAuth         bool   `yaml:"basicAuth"`
+	BasicAuthUser     string `yaml:"basicAuthUser,omitempty"`
+	BasicAuthPass     string `yaml:"basicAuthPass,omitempty"`
 	URLMode           string `yaml:"urlMode"`
 	PreserveHost      bool   `yaml:"preserveHost"`
 	AllowDshUiExpose  bool   `yaml:"allowDshUiExpose"`

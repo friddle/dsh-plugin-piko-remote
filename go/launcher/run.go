@@ -41,6 +41,11 @@ type runState struct {
 	TunnelNote string `json:"tunnelNote,omitempty"`
 }
 
+// accessRecordSkew is how far before the run started an access record may have
+// been written and still count as this run's. The tunnel can be up before the
+// readiness loop takes its first timestamp.
+const accessRecordSkew = 10 * time.Second
+
 // dshWebLineRE matches the boot line DSH prints with its loopback URL and token.
 var dshWebLineRE = regexp.MustCompile(`dsh web:\s*(http://\S+)`)
 
@@ -55,6 +60,9 @@ type accessRecord struct {
 	AuthUser  string `json:"authUser"`
 	AuthPass  string `json:"authPass"`
 	ExpiresAt string `json:"expiresAt"`
+	// WrittenAt is when the plugin published the record. It is what separates
+	// this run's tunnel from one an earlier run left behind in the same file.
+	WrittenAt string `json:"writtenAt"`
 }
 
 // parseLocalURL finds the DSH web URL in the log.
@@ -79,8 +87,13 @@ func tokenFromURL(raw string) string {
 	return token
 }
 
-// readAccessFile loads the plugin's credentials file, if it exists yet.
-func readAccessFile(path string) (accessRecord, bool) {
+// readAccessFile loads the plugin's credentials file, if this run wrote it.
+//
+// The freshness check matters: the file lives at a fixed path, so a record from
+// a previous `up` — a different endpoint, different credentials, possibly a
+// tunnel that no longer exists — would otherwise be reported as this run's
+// public URL the moment the process starts.
+func readAccessFile(path string, notBefore time.Time) (accessRecord, bool) {
 	if path == "" {
 		return accessRecord{}, false
 	}
@@ -92,7 +105,16 @@ func readAccessFile(path string) (accessRecord, bool) {
 	if err := json.Unmarshal(raw, &record); err != nil {
 		return accessRecord{}, false
 	}
-	return record, record.RemoteURL != ""
+	if record.RemoteURL == "" {
+		return accessRecord{}, false
+	}
+	if record.WrittenAt != "" {
+		written, err := time.Parse(time.RFC3339, record.WrittenAt)
+		if err == nil && written.Before(notBefore) {
+			return accessRecord{}, false
+		}
+	}
+	return record, true
 }
 
 // tunnelNoteFromLog reports the plugin's reason for not exposing, if it gave one.
@@ -206,6 +228,12 @@ func stopProcessGroup(pid, pgid int, timeout time.Duration) error {
 // failure: the local URL is still useful, and the log line explaining why is
 // more actionable than an error the caller has to go digging for.
 func waitReady(ctx context.Context, log *logger, state *runState, expectTunnel bool, timeout time.Duration) error {
+	notBefore := time.Now().Add(-accessRecordSkew)
+	if state.StartedAt != "" {
+		if parsed, err := time.Parse(time.RFC3339, state.StartedAt); err == nil {
+			notBefore = parsed.Add(-accessRecordSkew)
+		}
+	}
 	deadline := time.Now().Add(timeout)
 	reportEvery := 5 * time.Second
 	lastReport := time.Now()
@@ -227,7 +255,7 @@ func waitReady(ctx context.Context, log *logger, state *runState, expectTunnel b
 		}
 
 		if expectTunnel && state.RemoteURL == "" {
-			if record, ok := readAccessFile(state.AccessFile); ok {
+			if record, ok := readAccessFile(state.AccessFile, notBefore); ok {
 				state.RemoteURL = record.RemoteURL
 				state.Endpoint = record.Endpoint
 				state.AuthUser = record.AuthUser

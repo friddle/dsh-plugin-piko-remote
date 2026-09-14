@@ -296,6 +296,72 @@ func TestWithPathReplacesExistingPath(t *testing.T) {
 	}
 }
 
+func TestBuildChildEnv(t *testing.T) {
+	base := []string{"HOME=/home/u", "PATH=/usr/bin:/bin", "DEEPSEEK_API_KEY=old"}
+
+	t.Run("layers KEY=VALUE over the base environment", func(t *testing.T) {
+		env, err := buildChildEnv(base, []string{"DEEPSEEK_API_KEY=sk-new", "EXTRA=1"}, "/opt/node/bin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		joined := strings.Join(env, "\n")
+		if strings.Contains(joined, "DEEPSEEK_API_KEY=old") {
+			t.Error("the previous value should have been replaced")
+		}
+		if !strings.Contains(joined, "DEEPSEEK_API_KEY=sk-new") || !strings.Contains(joined, "EXTRA=1") {
+			t.Errorf("overrides missing:\n%s", joined)
+		}
+		if !strings.Contains(joined, "PATH=/opt/node/bin"+string(os.PathListSeparator)+"/usr/bin:/bin") {
+			t.Errorf("managed node must lead PATH:\n%s", joined)
+		}
+	})
+
+	t.Run("refuses malformed entries and a PATH override", func(t *testing.T) {
+		if _, err := buildChildEnv(base, []string{"NOEQUALS"}, "/opt/node/bin"); err == nil {
+			t.Error("expected a malformed entry to be refused")
+		}
+		if _, err := buildChildEnv(base, []string{"PATH=/evil"}, "/opt/node/bin"); err == nil {
+			t.Error("expected PATH to be protected")
+		}
+	})
+
+	t.Run("without overrides it only fixes PATH", func(t *testing.T) {
+		env, err := buildChildEnv(base, nil, "/opt/node/bin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(env) != len(base) {
+			t.Fatalf("entry count changed: %d -> %d", len(base), len(env))
+		}
+	})
+}
+
+func TestOverlayCarriesFixedCredentials(t *testing.T) {
+	body, err := renderOverlay(overlayConfig{
+		Remote:        "https://clauded.friddle.me",
+		BasicAuth:     true,
+		BasicAuthUser: "friddle",
+		BasicAuthPass: "sybran_20250807",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	if !strings.Contains(text, "basicAuthUser: friddle") || !strings.Contains(text, "basicAuthPass: sybran_20250807") {
+		t.Fatalf("fixed credentials missing from the overlay:\n%s", text)
+	}
+
+	// Unset credentials must stay out of the overlay entirely, so the helper's
+	// random generation remains the default.
+	plain, err := renderOverlay(overlayConfig{Remote: "https://x", BasicAuth: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(plain), "basicAuthUser") || strings.Contains(string(plain), "basicAuthPass") {
+		t.Fatalf("empty credentials should be omitted:\n%s", plain)
+	}
+}
+
 func TestDefaultPlugins(t *testing.T) {
 	if got := defaultPlugins(nil); len(got) != 1 || got[0] != defaultRemotePlugin {
 		t.Fatalf("defaultPlugins(nil) = %v", got)
@@ -446,6 +512,70 @@ func TestWaitReadyReportsTunnelNote(t *testing.T) {
 	}
 	if !strings.Contains(state.TunnelNote, "connection refused") {
 		t.Fatalf("tunnel note = %q", state.TunnelNote)
+	}
+}
+
+func TestWaitReadyAcceptsAFreshAccessRecord(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "dsh.log")
+	accessPath := filepath.Join(dir, "access.json")
+	if err := os.WriteFile(logPath, []byte("dsh web: http://127.0.0.1:41587/?token=tok\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	record := accessRecord{
+		Endpoint:  "dsh-kyd4h7",
+		RemoteURL: "https://dsh-kyd4h7.clauded.friddle.me/",
+		AuthUser:  "friddle",
+		AuthPass:  "sybran_20250807",
+		WrittenAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	body, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(accessPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	state := &runState{PID: os.Getpid(), LogFile: logPath, AccessFile: accessPath}
+	if err := waitReady(context.Background(), testLogger(), state, true, 5*time.Second); err != nil {
+		t.Fatalf("waitReady: %v", err)
+	}
+	if state.RemoteURL != record.RemoteURL || state.AuthUser != "friddle" {
+		t.Fatalf("fresh record not adopted: %+v", state)
+	}
+}
+
+func TestWaitReadyIgnoresStaleAccessRecord(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "dsh.log")
+	accessPath := filepath.Join(dir, "access.json")
+	if err := os.WriteFile(logPath, []byte("dsh web: http://127.0.0.1:41587/?token=tok\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stale := accessRecord{
+		Endpoint:  "dsh-oldendp",
+		RemoteURL: "https://dsh-oldendp.clauded.friddle.me/",
+		AuthUser:  "someoneelse",
+		WrittenAt: "2020-01-01T00:00:00Z",
+	}
+	body, err := json.Marshal(stale)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(accessPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	state := &runState{PID: os.Getpid(), LogFile: logPath, AccessFile: accessPath}
+	if err := waitReady(context.Background(), testLogger(), state, true, 300*time.Millisecond); err != nil {
+		t.Fatalf("waitReady: %v", err)
+	}
+	if state.RemoteURL != "" {
+		t.Fatalf("a record from an earlier run must not be reported as this run's tunnel: %+v", state)
+	}
+	if !strings.Contains(state.TunnelNote, "timed out") {
+		t.Fatalf("expected a timeout note, got %q", state.TunnelNote)
 	}
 }
 

@@ -122,6 +122,9 @@ up flags:
   --dsh PATH            use this dsh binary instead of installing one
   --dsh-version V       dsh version to install (default `+defaultDshVersion+`)
   --dsh-arg ARG         extra argument for dsh, repeatable
+  --env KEY=VALUE       environment entry for dsh, repeatable (e.g. the model key)
+  --auth-user USER      fixed tunnel Basic Auth user (default: random)
+  --auth-pass PASS      fixed tunnel Basic Auth password (default: random)
   --node PATH           use this node instead of installing one
   --node-version V      Node version to install when needed (default `+defaultNodeVersion+`)
   --registry URL        npm registry for installs
@@ -204,6 +207,9 @@ func (m *multiFlag) Set(value string) error {
 type upOptions struct {
 	plugins     multiFlag
 	dshArgs     multiFlag
+	childEnv    multiFlag
+	authUser    string
+	authPass    string
 	profile     string
 	remote      string
 	endpoint    string
@@ -242,6 +248,9 @@ func parseUpFlags(argv []string) (*upOptions, error) {
 	flags.Usage = func() { usage(flags.Output()) }
 	flags.Var(&opts.plugins, "plugin", "plugin to install (repeatable)")
 	flags.Var(&opts.dshArgs, "dsh-arg", "extra dsh argument (repeatable)")
+	flags.Var(&opts.childEnv, "env", "environment entry KEY=VALUE for dsh (repeatable)")
+	flags.StringVar(&opts.authUser, "auth-user", "", "fixed tunnel Basic Auth user")
+	flags.StringVar(&opts.authPass, "auth-pass", "", "fixed tunnel Basic Auth password")
 	flags.StringVar(&opts.profile, "profile", defaultProfileName, "DSH profile name")
 	flags.StringVar(&opts.remote, "remote", defaultRemote, "piko server URL")
 	flags.StringVar(&opts.endpoint, "endpoint", "", "fixed endpoint name")
@@ -277,6 +286,11 @@ func parseUpFlags(argv []string) (*upOptions, error) {
 			return nil, err
 		}
 	}
+	if opts.authUser != "" && opts.authPass == "" {
+		// The helper generates a password whenever one is not supplied, so a
+		// fixed user with a random password is a footgun worth naming.
+		fmt.Fprintln(os.Stderr, "warning: --auth-user without --auth-pass keeps a randomly generated password")
+	}
 	if !opts.basicAuth && opts.exposeDshUI {
 		return nil, errors.New("--expose-dsh-ui with --basic-auth=false would publish this machine's agent with no credential at all; keep Basic Auth on")
 	}
@@ -307,7 +321,10 @@ func cmdUp(argv []string) error {
 	if err != nil {
 		return err
 	}
-	env := withPath(os.Environ(), filepath.Dir(nodePath))
+	env, err := buildChildEnv(os.Environ(), opts.childEnv, filepath.Dir(nodePath))
+	if err != nil {
+		return err
+	}
 	runner := execRunner{env: env}
 
 	dshPath, dshVersion, err := ensureDsh(ctx, log, opts, nodePath, runner)
@@ -341,6 +358,8 @@ func cmdUp(argv []string) error {
 			Remote:            opts.remote,
 			EndpointPrefix:    "dsh",
 			BasicAuth:         opts.basicAuth,
+			BasicAuthUser:     opts.authUser,
+			BasicAuthPass:     opts.authPass,
 			URLMode:           "subdomain",
 			PreserveHost:      false,
 			AllowDshUiExpose:  opts.exposeDshUI,
@@ -489,18 +508,61 @@ func ensureToken(raw, token string) string {
 	return raw + separator + "token=" + token
 }
 
+// buildChildEnv layers explicit KEY=VALUE entries over base, then puts dir first
+// on PATH.
+//
+// PATH is rebuilt last and cannot be overridden: `dsh` is a JS shim, so the
+// managed Node has to stay findable even if someone passes --env PATH=...
+func buildChildEnv(base, extra []string, dir string) ([]string, error) {
+	if len(extra) == 0 {
+		return withPath(base, dir), nil
+	}
+
+	overrides := make(map[string]string, len(extra))
+	for _, entry := range extra {
+		key, value, found := strings.Cut(entry, "=")
+		if !found || key == "" {
+			return nil, fmt.Errorf("--env %q is not KEY=VALUE", entry)
+		}
+		if key == "PATH" {
+			return nil, errors.New("--env PATH=... is not allowed: the managed Node must stay on PATH")
+		}
+		overrides[key] = value
+	}
+
+	merged := make([]string, 0, len(base)+len(overrides))
+	for _, entry := range base {
+		key, _, _ := strings.Cut(entry, "=")
+		if _, replaced := overrides[key]; replaced {
+			continue
+		}
+		merged = append(merged, entry)
+	}
+	for key, value := range overrides {
+		merged = append(merged, key+"="+value)
+	}
+	return withPath(merged, dir), nil
+}
+
 // withPath returns env with dir first on PATH, replacing any existing PATH
 // entry: a duplicated PATH would leave the child's lookup order to the OS.
 func withPath(env []string, dir string) []string {
+	existing := ""
 	out := make([]string, 0, len(env)+1)
 	for _, entry := range env {
 		if strings.HasPrefix(entry, "PATH=") {
+			// Taken from env rather than os.Getenv so the function depends only
+			// on what it was handed, which is what makes it testable.
+			existing = strings.TrimPrefix(entry, "PATH=")
 			continue
 		}
 		out = append(out, entry)
 	}
-	existing := os.Getenv("PATH")
-	return append(out, "PATH="+dir+string(os.PathListSeparator)+existing)
+	path := dir
+	if existing != "" {
+		path = dir + string(os.PathListSeparator) + existing
+	}
+	return append(out, "PATH="+path)
 }
 
 // ensureNode uses a usable node when there is one, and installs its own when
