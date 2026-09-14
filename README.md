@@ -23,12 +23,34 @@
 可用。模型工具、子进程管理、隧道与鉴权均已实现，并通过真实公网链路验证：
 
 - `piko-expose`（`go/`）单跑即可连公共服务器，端到端冒烟脚本 3/3 通过。
-- 插件半侧（`lib/`）48 个单测 + Go 13 个单测通过。
+- 插件半侧（`lib/`）48 个单测 + Go 单测（helper 13 + 启动器 26）通过。
+- 一键启动器 `dsh-piko-remote` 已在**空环境**远程主机实测：自动装 Node + dsh +
+  插件并给出可用公网地址。
 - 已在远程 Linux 主机上以 `dsh` + 本插件跑通 DSH Web 的公网访问：
   SPA `200`、`/assets/*.js` `200`、`/api/remote.mux`（WebSocket）`101`。
 
 尚未做（见 [PLAN.md](./PLAN.md) Phase 6）：客户端设置卡片、settings 命名空间、
 release 时交叉编译并随包发布 helper。
+
+## 一键启动（推荐）
+
+仓库里第二个 Go 命令 `dsh-piko-remote` 负责把整套东西装好并跑起来，
+用法与 opencode 那边的 `opencode-piko-remote` 对齐：
+
+```bash
+dsh-piko-remote up                                  # 装 Node/dsh/插件 → 启动 → 打印公网地址与随机账号密码
+dsh-piko-remote up --plugin someone/their-plugin     # 插件地址可指定，owner/repo 自动指向 GitHub
+dsh-piko-remote status | logs | down
+```
+
+它会自动：准备满足 DSH `engines` 的 Node（不够就自己下一份，不碰系统 Node）→
+装 `@deepseek-ai/dsh` 与 `pnpm` → 从 web 模板建一个专用 profile → 装插件 →
+补齐插件缺的 peerDependency → 把内嵌的 `piko-expose` 补进插件的 `bin/` →
+生成 `--patch` overlay（不改你自己的 `cordis.patch.yml`）→ `setsid` 后台启动 →
+等就绪后打印本地地址、公网地址、随机账号密码。
+
+`--plugin` 支持 `owner/repo`（→ `github:owner/repo`）、`@scope/pkg@ver`、本地目录、
+`.tgz`、URL，可重复。完整参数与设计说明见 [docs/launcher.md](./docs/launcher.md)。
 
 ## 安装
 

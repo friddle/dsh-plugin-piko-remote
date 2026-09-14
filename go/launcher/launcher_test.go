@@ -1,0 +1,549 @@
+package main
+
+import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
+	"context"
+	"encoding/json"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// fakeRunner records invocations and can simulate the side effects of the real
+// commands, which is how the install orchestration is tested without a network,
+// a Node toolchain, or a real dsh.
+type fakeRunner struct {
+	calls [][]string
+	onRun func(name string, args []string) error
+}
+
+func (f *fakeRunner) run(_ context.Context, _ *logger, name string, args ...string) (string, error) {
+	f.calls = append(f.calls, append([]string{name}, args...))
+	if f.onRun != nil {
+		if err := f.onRun(name, args); err != nil {
+			return "", err
+		}
+	}
+	return "ok", nil
+}
+
+func (f *fakeRunner) ran(substring string) bool {
+	for _, call := range f.calls {
+		if strings.Contains(strings.Join(call, " "), substring) {
+			return true
+		}
+	}
+	return false
+}
+
+func testLogger() *logger {
+	return &logger{mu: &sync.Mutex{}, out: io.Discard}
+}
+
+func TestExpandPluginSpec(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantSpec string
+		wantKind pluginKind
+	}{
+		{"friddle/dsh-plugin-piko-remote", "github:friddle/dsh-plugin-piko-remote", kindGitHub},
+		{"owner/repo#v1.2.3", "github:owner/repo#v1.2.3", kindGitHub},
+		{"github:friddle/dsh-plugin-piko-remote", "github:friddle/dsh-plugin-piko-remote", kindGitHub},
+		{"git+https://example.com/x.git", "git+https://example.com/x.git", kindGitHub},
+		{"@deepseek-ai/dsh-tools", "@deepseek-ai/dsh-tools", kindNPM},
+		{"@scope/pkg@0.1.5-rc.1", "@scope/pkg@0.1.5-rc.1", kindNPM},
+		{"left-pad", "left-pad", kindNPM},
+		{"left-pad@1.0.0", "left-pad@1.0.0", kindNPM},
+		{"./local-plugin", "./local-plugin", kindLocal},
+		{"/abs/local-plugin", "/abs/local-plugin", kindLocal},
+		{"file:../sibling", "file:../sibling", kindLocal},
+		{"~/plugins/mine", "~/plugins/mine", kindLocal},
+		{"https://example.com/plugin.tgz", "https://example.com/plugin.tgz", kindURL},
+		{"dsh-plugin-piko-remote-0.2.0.tgz", "dsh-plugin-piko-remote-0.2.0.tgz", kindNPM},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			got, err := expandPluginSpec(tc.in)
+			if err != nil {
+				t.Fatalf("expandPluginSpec(%q): %v", tc.in, err)
+			}
+			if got.Spec != tc.wantSpec {
+				t.Fatalf("spec = %q, want %q", got.Spec, tc.wantSpec)
+			}
+			if got.Kind != tc.wantKind {
+				t.Fatalf("kind = %q, want %q", got.Kind, tc.wantKind)
+			}
+		})
+	}
+
+	t.Run("a GitHub shorthand is recognised as this plugin", func(t *testing.T) {
+		plugin, err := expandPluginSpec("friddle/dsh-plugin-piko-remote")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !plugin.isPikoRemote() {
+			t.Fatal("expected the shorthand to be recognised as piko-remote")
+		}
+	})
+
+	t.Run("whitespace is trimmed, empty and invalid specs are refused", func(t *testing.T) {
+		got, err := expandPluginSpec("  owner/repo  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Spec != "github:owner/repo" {
+			t.Fatalf("spec = %q", got.Spec)
+		}
+		if _, err := expandPluginSpec("   "); err == nil {
+			t.Fatal("blank spec should fail")
+		}
+		if _, err := expandPluginSpec("two words"); err == nil {
+			t.Fatal("spec with an inner space should fail")
+		}
+	})
+}
+
+func TestExpandPluginSpecsDedupes(t *testing.T) {
+	plugins, err := expandPluginSpecs([]string{"owner/repo", "github:owner/repo", "@scope/pkg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plugins) != 2 {
+		t.Fatalf("got %d plugins, want 2: %+v", len(plugins), plugins)
+	}
+}
+
+func TestNodeVersionSupported(t *testing.T) {
+	cases := map[string]bool{
+		"v22.19.0": true,
+		"v22.20.1": true,
+		"v24.0.0":  true,
+		"v25.9.0":  true,
+		"v22.18.0": false,
+		"v20.20.0": false,
+		"v23.5.0":  false,
+		"v18.19.1": false,
+		"nonsense": false,
+		"":         false,
+	}
+	for input, want := range cases {
+		if got := nodeVersionSupported(input); got != want {
+			t.Errorf("nodeVersionSupported(%q) = %v, want %v", input, got, want)
+		}
+	}
+}
+
+func TestParseNodeVersion(t *testing.T) {
+	major, minor, patch, err := parseNodeVersion("v24.19.0\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if major != 24 || minor != 19 || patch != 0 {
+		t.Fatalf("got %d.%d.%d", major, minor, patch)
+	}
+	if _, _, _, err := parseNodeVersion("not a version"); err == nil {
+		t.Fatal("expected an error")
+	}
+}
+
+func TestParseLocalURLAndToken(t *testing.T) {
+	logText := "some other output\ndsh web: http://127.0.0.1:3080/?token=3HXi3Ga-4djTKQV7ErwvRXm2cU5ws5ZoSjyhpGY87MA\nmore\n"
+	url, ok := parseLocalURL(logText)
+	if !ok {
+		t.Fatal("expected the dsh web line to be found")
+	}
+	if url != "http://127.0.0.1:3080/?token=3HXi3Ga-4djTKQV7ErwvRXm2cU5ws5ZoSjyhpGY87MA" {
+		t.Fatalf("url = %q", url)
+	}
+	if token := tokenFromURL(url); token != "3HXi3Ga-4djTKQV7ErwvRXm2cU5ws5ZoSjyhpGY87MA" {
+		t.Fatalf("token = %q", token)
+	}
+	if _, ok := parseLocalURL("nothing here"); ok {
+		t.Fatal("expected no match")
+	}
+	if token := tokenFromURL("http://127.0.0.1:3080/"); token != "" {
+		t.Fatalf("token = %q, want empty", token)
+	}
+}
+
+func TestTunnelNoteFromLog(t *testing.T) {
+	text := "[piko-remote] loaded; remote=https://x\n! [piko-remote] autoExpose ignored: allowDshUiExpose is false\n"
+	note := tunnelNoteFromLog(text)
+	if !strings.Contains(note, "allowDshUiExpose") {
+		t.Fatalf("note = %q", note)
+	}
+	if tunnelNoteFromLog("nothing relevant") != "" {
+		t.Fatal("expected no note")
+	}
+}
+
+func TestRenderOverlay(t *testing.T) {
+	body, err := renderOverlay(overlayConfig{
+		Remote:            "https://clauded.friddle.me",
+		EndpointPrefix:    "dsh",
+		BasicAuth:         true,
+		URLMode:           "subdomain",
+		PreserveHost:      false,
+		AllowDshUiExpose:  true,
+		AutoExpose:        true,
+		DefaultTTLMinutes: 480,
+		CredentialsFile:   "/home/u/.local/share/dsh-piko-remote/access.json",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	for _, want := range []string{
+		"id: piko-remote",
+		"remote: https://clauded.friddle.me",
+		"preserveHost: false",
+		"allowDshUiExpose: true",
+		"autoExpose: true",
+		"defaultTtlMinutes: 480",
+		"credentialsFile: /home/u/.local/share/dsh-piko-remote/access.json",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("overlay is missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "endpoint:") {
+		t.Errorf("an unset endpoint should be omitted:\n%s", text)
+	}
+
+	withEndpoint, err := renderOverlay(overlayConfig{Endpoint: "dsh-demo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(withEndpoint), "endpoint: dsh-demo") {
+		t.Errorf("expected the fixed endpoint in the overlay:\n%s", withEndpoint)
+	}
+}
+
+func TestStripTopLevelAndSafeJoin(t *testing.T) {
+	if name, ok := stripTopLevel("node-v24.19.0-linux-x64/bin/node"); !ok || name != "bin/node" {
+		t.Fatalf("stripTopLevel = %q, %v", name, ok)
+	}
+	if _, ok := stripTopLevel("toplevelonly"); ok {
+		t.Fatal("a single-element name has nothing to strip")
+	}
+
+	if _, err := safeJoin("/tmp/dest", "bin/node"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := safeJoin("/tmp/dest", "../../etc/passwd"); err == nil {
+		t.Fatal("expected traversal to be refused")
+	}
+}
+
+func TestSaveAndLoadState(t *testing.T) {
+	dir := t.TempDir()
+	path := statePath(dir)
+	state := runState{
+		Profile:   "dsh-piko",
+		PID:       1234,
+		PGID:      1234,
+		LocalURL:  "http://127.0.0.1:3080/?token=abc",
+		RemoteURL: "https://dsh-demo.clauded.friddle.me/",
+		AuthUser:  "user",
+		AuthPass:  "pass",
+		Token:     "abc",
+	}
+	if err := saveState(path, state); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := info.Mode().Perm(); mode != 0o600 {
+		t.Fatalf("state mode = %o, want 600 (it holds a live token and credentials)", mode)
+	}
+
+	loaded, err := loadState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded != state {
+		t.Fatalf("round trip mismatch:\n got %+v\nwant %+v", loaded, state)
+	}
+}
+
+func TestWithPathReplacesExistingPath(t *testing.T) {
+	env := []string{"HOME=/home/u", "PATH=/usr/bin:/bin", "LANG=C"}
+	got := withPath(env, "/opt/node/bin")
+
+	pathEntries := 0
+	for _, entry := range got {
+		if strings.HasPrefix(entry, "PATH=") {
+			pathEntries++
+			if !strings.HasPrefix(entry, "PATH=/opt/node/bin"+string(os.PathListSeparator)) {
+				t.Fatalf("managed node is not first on PATH: %q", entry)
+			}
+		}
+	}
+	if pathEntries != 1 {
+		t.Fatalf("found %d PATH entries, want exactly 1", pathEntries)
+	}
+	if len(got) != len(env) {
+		t.Fatalf("entry count changed: %d -> %d", len(env), len(got))
+	}
+}
+
+func TestDefaultPlugins(t *testing.T) {
+	if got := defaultPlugins(nil); len(got) != 1 || got[0] != defaultRemotePlugin {
+		t.Fatalf("defaultPlugins(nil) = %v", got)
+	}
+	if got := defaultPlugins([]string{"owner/repo"}); len(got) != 1 || got[0] != "owner/repo" {
+		t.Fatalf("explicit plugins must win, got %v", got)
+	}
+}
+
+func TestEnsureProfileCreatesFromTemplate(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("DSH_HOME", home)
+
+	runner := &fakeRunner{onRun: func(_ string, args []string) error {
+		// Simulate `dsh --profile X --from-default-profile web --dump-config`.
+		if !contains(args, "--dump-config") {
+			return nil
+		}
+		dir := filepath.Join(home, "profiles", "dsh-piko")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(dir, "package.json"), []byte(`{"dependencies":{}}`), 0o644)
+	}}
+
+	if err := ensureProfile(context.Background(), testLogger(), runner, "dsh", "dsh-piko"); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.ran("--from-default-profile web") {
+		t.Fatalf("expected the profile to be initialised, calls: %v", runner.calls)
+	}
+
+	// A second call must be a no-op now that the profile exists.
+	before := len(runner.calls)
+	if err := ensureProfile(context.Background(), testLogger(), runner, "dsh", "dsh-piko"); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.calls) != before {
+		t.Fatal("an existing profile must not be re-initialised")
+	}
+}
+
+func TestInstallPluginsDetectsNewDependencies(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("DSH_HOME", home)
+
+	profileDir := filepath.Join(home, "profiles", "dsh-piko")
+	if err := os.MkdirAll(profileDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeManifest := func(deps map[string]string) {
+		body, err := json.Marshal(map[string]any{"dependencies": deps})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(profileDir, "package.json"), body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeManifest(map[string]string{})
+
+	runner := &fakeRunner{onRun: func(name string, args []string) error {
+		if name != "dsh" || !contains(args, "add") {
+			return nil
+		}
+		// Simulate pnpm resolving a GitHub spec to the package's real name.
+		writeManifest(map[string]string{pikoRemotePackage: "github:friddle/dsh-plugin-piko-remote"})
+		return nil
+	}}
+
+	plugins, err := expandPluginSpecs([]string{"friddle/dsh-plugin-piko-remote"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	installed, err := installPlugins(context.Background(), testLogger(), runner, "dsh", "dsh-piko", plugins)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(installed) != 1 || installed[0] != pikoRemotePackage {
+		t.Fatalf("installed = %v, want [%s]", installed, pikoRemotePackage)
+	}
+	if !runner.ran("plugin --profile dsh-piko add github:friddle/dsh-plugin-piko-remote") {
+		t.Fatalf("unexpected calls: %v", runner.calls)
+	}
+}
+
+func TestSatisfyPeersInstallsMissingPeer(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("DSH_HOME", home)
+
+	modules := filepath.Join(home, "profiles", "dsh-piko", "node_modules")
+	pluginDir := filepath.Join(modules, pikoRemotePackage)
+	if err := os.MkdirAll(pluginDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := `{"name":"dsh-plugin-piko-remote","peerDependencies":{"@deepseek-ai/dsh-tools":"^0.1.5-rc.1"}}`
+	if err := os.WriteFile(filepath.Join(pluginDir, "package.json"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &fakeRunner{}
+	if err := satisfyPeers(context.Background(), testLogger(), runner, "dsh", "dsh-piko", []string{pikoRemotePackage}); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.ran("add @deepseek-ai/dsh-tools@^0.1.5-rc.1") {
+		t.Fatalf("expected the missing peer to be installed, calls: %v", runner.calls)
+	}
+
+	// Once the peer exists, nothing more should be installed.
+	if err := os.MkdirAll(filepath.Join(modules, "@deepseek-ai", "dsh-tools"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runner.calls = nil
+	if err := satisfyPeers(context.Background(), testLogger(), runner, "dsh", "dsh-piko", []string{pikoRemotePackage}); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("a satisfied peer must not be reinstalled: %v", runner.calls)
+	}
+}
+
+func TestEnsureToken(t *testing.T) {
+	if got := ensureToken("https://x.example/", "abc"); got != "https://x.example/?token=abc" {
+		t.Fatalf("got %q", got)
+	}
+	if got := ensureToken("https://x.example/?a=1", "abc"); got != "https://x.example/?a=1&token=abc" {
+		t.Fatalf("got %q", got)
+	}
+	if got := ensureToken("https://x.example/?token=abc", "abc"); got != "https://x.example/?token=abc" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestWaitReadyReportsTunnelNote(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "dsh.log")
+	body := "dsh web: http://127.0.0.1:3080/?token=tok\n! [piko-remote] autoExpose failed: connection refused\n"
+	if err := os.WriteFile(logPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	state := &runState{PID: os.Getpid(), LogFile: logPath}
+	if err := waitReady(context.Background(), testLogger(), state, true, 5*time.Second); err != nil {
+		t.Fatalf("waitReady: %v", err)
+	}
+	if state.LocalURL == "" || state.Token != "tok" {
+		t.Fatalf("local URL/token not captured: %+v", state)
+	}
+	if !strings.Contains(state.TunnelNote, "connection refused") {
+		t.Fatalf("tunnel note = %q", state.TunnelNote)
+	}
+}
+
+func TestWaitReadyTimesOutWithoutWebLine(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "dsh.log")
+	if err := os.WriteFile(logPath, []byte("starting up\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state := &runState{PID: os.Getpid(), LogFile: logPath}
+	err := waitReady(context.Background(), testLogger(), state, false, 300*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("expected a timeout error, got %v", err)
+	}
+}
+
+func TestEnsureHelperBinaryPlantsEmbeddedHelper(t *testing.T) {
+	name, err := helperFileName()
+	if err != nil {
+		t.Skipf("no helper name for this platform: %v", err)
+	}
+	if _, _, err := helperBinaries(name); err != nil {
+		t.Skipf("this build carries no helper to plant: %v", err)
+	}
+
+	home := t.TempDir()
+	t.Setenv("DSH_HOME", home)
+	packageDir := filepath.Join(home, "profiles", "dsh-piko", "node_modules", pikoRemotePackage)
+	if err := os.MkdirAll(packageDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ensureHelperBinary(testLogger(), "dsh-piko", pikoRemotePackage); err != nil {
+		t.Fatalf("ensureHelperBinary: %v", err)
+	}
+
+	target := filepath.Join(packageDir, "bin", name)
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("helper not planted: %v", err)
+	}
+	if info.Size() == 0 {
+		t.Fatal("planted helper is empty")
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("planted helper is not executable: %v", info.Mode())
+	}
+}
+
+func TestExtractTarGzStripsTopLevelDirectory(t *testing.T) {
+	// A real Node tarball wraps everything in `node-vX-os-arch/`; extraction
+	// strips exactly that, which is why the caller must extract into a
+	// version-named directory rather than straight into the install root.
+	var buffer bytes.Buffer
+	gzipWriter := gzip.NewWriter(&buffer)
+	tarWriter := tar.NewWriter(gzipWriter)
+
+	files := map[string]string{
+		"node-v1-linux-x64/bin/node":    "#!/bin/sh\necho v1\n",
+		"node-v1-linux-x64/README.md":   "readme",
+		"node-v1-linux-x64/lib/node.js": "// lib",
+	}
+	for name, body := range files {
+		if err := tarWriter.WriteHeader(&tar.Header{
+			Name: name, Mode: 0o755, Size: int64(len(body)), Typeflag: tar.TypeReg,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tarWriter.Write([]byte(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tarWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gzipWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dest := t.TempDir()
+	if err := extractTarGz(bytes.NewReader(buffer.Bytes()), dest); err != nil {
+		t.Fatalf("extractTarGz: %v", err)
+	}
+	for _, want := range []string{"bin/node", "README.md", "lib/node.js"} {
+		if _, err := os.Stat(filepath.Join(dest, filepath.FromSlash(want))); err != nil {
+			t.Errorf("expected %s in the extraction root: %v", want, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dest, "node-v1-linux-x64")); !os.IsNotExist(err) {
+		t.Error("the top-level directory should have been stripped")
+	}
+}
+
+func contains(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}

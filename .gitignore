@@ -6,6 +6,13 @@ dist/
 # Go helper build output (cross-compiled per platform)
 bin/
 
+# The launcher embeds piko-expose for its own platform; the copies are staged
+# here by scripts/build-helper.sh and are build output, not source.
+go/launcher/assets/piko-expose-*
+
 # Local scratch: sandboxed Go caches, downloaded probe packages, notes.
 .build/
 .probe/
+
+# Packed plugin artifacts
+*.tgz

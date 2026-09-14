@@ -14,13 +14,14 @@
   },
   "files": [
     "lib",
-    "bin",
+    "bin/piko-expose-*",
     "cordis.patch.yml",
     "README.md",
     "PLAN.md"
   ],
   "scripts": {
     "test": "node --test test/*.test.js",
+    "build": "scripts/build-helper.sh",
     "build:helper": "scripts/build-helper.sh",
     "smoke": "scripts/smoke-test.sh"
   },

@@ -14,6 +14,7 @@
 | Go helper `piko-expose` | ✅ | `go/`，13 个单测；`scripts/smoke-test.sh` 真实公网 3/3 |
 | 插件半侧（supervisor / endpoint / tools / config） | ✅ | `lib/`，48 个 node 单测 |
 | 三个模型工具 | ✅ | `remote_expose` / `remote_status` / `remote_close` |
+| 一键启动器 `dsh-piko-remote` | ✅ | `go/launcher/`，26 个单测；空环境远程实测（自动装 Node + dsh + 插件 → 地址） |
 | 子域名模式端到端 | ✅ | `dsh-zi38kw.clauded.friddle.me`：SPA 200、`/assets/*.js` 200、`/api/remote.mux` **101** |
 | 远程部署链路 | ✅ | `docs/remote-deploy.md`（Ubuntu + `dsh@0.1.5-rc.1` + tarball 安装） |
 
@@ -383,9 +384,28 @@ piko-remote:
 ### Phase 6 — 客户端 UI 与发布
 - [ ] `client/client.js`：`settings.plugin.item`（namespace `piko-remote`）卡片：地址、复制、二维码、启停
 - [ ] 可选：`sidebar.footer.action` 小入口
-- [ ] README（中英）、`docs/troubleshooting.md`、截图
-- [ ] GitHub Actions：release 时交叉编译 helper 并随 npm 包发布
+- [x] README、`docs/remote-deploy.md`、`docs/launcher.md`
+- [ ] `docs/troubleshooting.md`、截图
+- [ ] GitHub Actions：release 时交叉编译 helper + 启动器
 - [ ] 发布 npm + 提交 dsh-market 收录（可选）
+
+### Phase 7 — 一键启动器 ✅（原计划外，用户追加）
+
+对应 opencode 侧的 `opencode-piko-remote`：一条命令把运行时、插件、启动、地址全包了。
+
+- [x] `go/launcher`：`up` / `down` / `status` / `logs` / `version`
+- [x] 自动准备 Node（不满足 `engines` 时下载到自己的数据目录，先 npmmirror 后官方）
+- [x] 自动装 `@deepseek-ai/dsh` + `pnpm` 到托管 Node 前缀
+- [x] 从 web 模板建专用 profile；`dsh plugin add` 装插件
+- [x] 自动补齐插件缺失的 peerDependency（`autoInstallPeers: false` 的坑）
+- [x] 内嵌 `piko-expose` 并补进插件的 `bin/`（GitHub/npm 装的插件没有二进制）
+- [x] 隧道配置走 `--patch` overlay，**不改**用户自己的 `cordis.patch.yml`
+- [x] `setsid` 脱离会话后台启动 + 轮询日志/凭据文件判定就绪
+- [x] `--plugin` 支持 `owner/repo` → `github:owner/repo`、npm、本地目录/tarball、URL，可重复
+- [x] `--json` 单行结果，便于脚本消费
+- [x] 26 个单测（spec 展开、版本判定、overlay 渲染、归档解压、状态读写、安装编排、就绪判定）
+
+**出口标准**：✅ 空环境远程主机上 `dsh-piko-remote up` 一条命令拿到可用公网地址与随机账号密码。
 
 ---
 
