@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-piko-remote",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Expose a local port to a remote piko server from DeepSeek Harness, and hand back the public URL.",
   "license": "MIT",
   "type": "module",

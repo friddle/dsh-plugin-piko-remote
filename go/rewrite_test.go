@@ -1,10 +1,13 @@
 package main
 
 import (
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestStripPrefixPath(t *testing.T) {
@@ -323,5 +326,51 @@ func TestRandomStringIsUnbiasedAndBounded(t *testing.T) {
 	}
 	if len(seen) < 40 {
 		t.Fatalf("only %d distinct values out of 50 draws", len(seen))
+	}
+}
+
+func TestHandlerPreservesRawQuery(t *testing.T) {
+	// DSH's client-module bundles are fetched through a "concat" URL whose query
+	// literally starts with a second '?': /plugins/??a.js,b.js&rev=1. Re-encoding
+	// that query (url.Values round-trip) changes which modules are requested, and
+	// the client then fails with "HTML did not preload ...". The raw bytes have to
+	// survive the proxy.
+	seen := make(chan string, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.URL.RawQuery
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+
+	handler, err := newHandler(proxyConfig{
+		target:       strings.TrimPrefix(target.URL, "http://"),
+		preserveHost: true,
+	})
+	if err != nil {
+		t.Fatalf("newHandler: %v", err)
+	}
+	front := httptest.NewServer(handler)
+	defer front.Close()
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(front.URL, "http://"))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	request := "GET /plugins/??a.js,b.js&rev=1 HTTP/1.1\r\nHost: ep.example\r\nConnection: close\r\n\r\n"
+	if _, err := conn.Write([]byte(request)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := io.ReadAll(conn); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	select {
+	case got := <-seen:
+		if got != "?a.js,b.js&rev=1" {
+			t.Fatalf("target saw RawQuery %q, want %q", got, "?a.js,b.js&rev=1")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("target never received the request")
 	}
 }

@@ -64,10 +64,24 @@ func newHandler(cfg proxyConfig) (http.Handler, error) {
 			pr.Out.Host = pr.In.Host
 			pr.SetXForwarded()
 
+			// ReverseProxy sanitises the outbound query with cleanQueryParams
+			// *after* Rewrite runs, and that pass re-encodes any query whose
+			// first key is not `k=v`. DSH's client-module bundles are fetched
+			// through exactly such a URL — /plugins/??a.js,b.js&rev=… — so the
+			// sanitised form requests a different module set and the client
+			// fails with "HTML did not preload …". We never interpret query
+			// parameters, so the original bytes are both safe and required.
+			pr.Out.URL.RawQuery = pr.In.URL.RawQuery
+
 			pr.Out.URL.Path = stripPrefixPath(pr.Out.URL.Path, cfg.stripPrefix)
-			// RawPath is derived from Path; leaving a stale value would make
-			// the transport prefer the un-stripped encoded form.
-			pr.Out.URL.RawPath = ""
+			if pr.Out.URL.Path == pr.In.URL.Path {
+				// Nothing stripped, so the original percent-encoding still
+				// describes this path and should be kept.
+				pr.Out.URL.RawPath = pr.In.URL.RawPath
+			} else {
+				// The path changed, which makes the old RawPath stale.
+				pr.Out.URL.RawPath = ""
+			}
 
 			if !cfg.preserveHost {
 				localizeRequest(pr, targetURL)
