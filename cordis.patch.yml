@@ -1,0 +1,9 @@
+# dsh bundle patch: inserts this plugin into a profile's layer stack.
+#
+# `dsh plugin add` reconciles `dsh.profile.bundles` against the installed tree,
+# so this file is what makes the package a bundle rather than a plain
+# dependency. The row id is what a user's own cordis.patch.yml targets to
+# override or disable it.
+- insert:
+    - id: piko-remote
+      name: 'dsh-plugin-piko-remote'
