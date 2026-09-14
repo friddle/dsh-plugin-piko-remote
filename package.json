@@ -3,6 +3,15 @@
   "version": "0.3.1",
   "description": "Expose a local port to a remote piko server from DeepSeek Harness, and hand back the public URL.",
   "license": "MIT",
+  "author": "friddle",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/friddle/dsh-plugin-piko-remote.git"
+  },
+  "homepage": "https://github.com/friddle/dsh-plugin-piko-remote#readme",
+  "bugs": {
+    "url": "https://github.com/friddle/dsh-plugin-piko-remote/issues"
+  },
   "type": "module",
   "main": "lib/index.js",
   "exports": {
