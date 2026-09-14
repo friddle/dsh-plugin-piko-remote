@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-piko-remote",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Expose a local port to a remote piko server from DeepSeek Harness, and hand back the public URL.",
   "license": "MIT",
   "type": "module",
@@ -14,17 +14,27 @@
   },
   "files": [
     "lib",
+    "bin",
     "cordis.patch.yml",
     "README.md",
     "PLAN.md"
   ],
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "build:helper": "scripts/build-helper.sh",
+    "smoke": "scripts/smoke-test.sh"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
   },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.2"
+  },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2"
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-tools": "^0.1.5-rc.1"
   },
   "engines": {
     "node": "^22.19.0 || >=24.0.0"

@@ -5,3 +5,7 @@ dist/
 
 # Go helper build output (cross-compiled per platform)
 bin/
+
+# Local scratch: sandboxed Go caches, downloaded probe packages, notes.
+.build/
+.probe/
