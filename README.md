@@ -185,7 +185,31 @@ Linux 上 DSH 依次探测两条链（`@deepseek-ai/dsh-sandbox-local`）：
 - `landlock` 需要在物理机的内核命令行里启用（Proxmox 默认只开 apparmor），
   并且该 LSM 必须在容器的 `/sys/kernel/security/lsm` 里出现。
 
-容器里两样都拿不到时，正确做法就是 `--no-sandbox` / `danger-full-access`：命令不加包装地跑，
+容器里两样都拿不到时，有两条路：
+
+**1）用沙箱适配器，保住文件沙箱**（推荐）：
+
+```bash
+dsh-piko-remote up --sandbox-runner bwrap-noproc    # 或 auto：先探测再决定
+```
+
+DSH 的 `sandbox` 行接受操作者提供的 `runnerCommand`，并且会把**和 bwrap 完全相同的
+profile 参数**交给它（`@deepseek-ai/dsh-sandbox-local` 的 `confine()`）。启动器因此可以自己
+当这个 runner：把 `--unshare-pid` 和 `--proc /proc` 过滤掉，其余原样 `exec bwrap`。
+实测（本机 LXC）：
+
+```
+$ bwrap --ro-bind / / --dev /dev --tmpfs /tmp --bind <ws> <ws> --die-with-parent -- sh -c 'echo ok > <ws>/x'
+ok
+$ bwrap ... -- sh -c 'echo nope > /etc/probe'
+sh: cannot create /etc/probe: Read-only file system
+```
+
+`--ro-bind / /` 这条文件策略没变，所以「工作区外不可写」依然成立，DSH 也能把
+`Read-only file system` 正确识别成沙箱拒绝（它给自定义 runner 的拒绝签名正是这一句）；
+代价只是丢掉 PID namespace 隔离，而被沙箱的命令本来就和 DSH 跑在同一用户下。
+
+**2）干脆不走沙箱**：`--no-sandbox` / `danger-full-access`，命令不加包装地跑，
 也就没有「没法建沙箱所以拒绝执行」这种死路。
 
 ## 部署到远程主机

@@ -83,6 +83,9 @@ func run(argv []string) error {
 		return cmdStatus(argv)
 	case "logs":
 		return cmdLogs(argv)
+	case sandboxRunnerSubcommand:
+		// Not a user command: DSH invokes it as the `sandbox` row's runner.
+		return runSandboxRunner(argv)
 	case "version", "-V", "--version":
 		fmt.Println("dsh-piko-remote " + version)
 		return nil
@@ -135,6 +138,10 @@ up flags:
                         commands run unwrapped and approvals are off. Use it on
                         a host whose sandbox has no usable backend; the
                         per-session permission picker still overrides it
+  --sandbox-runner MODE sandbox backend: native (default: DSH's own bwrap/landlock
+                        chain), auto, or bwrap-noproc (same file policy, minus
+                        the PID namespace) — the adapter a container that
+                        refuses to mount a fresh /proc needs
   --force               reinstall node/dsh even when a usable one exists
   --json                print one JSON result object on stdout
 `)
@@ -232,6 +239,7 @@ type upOptions struct {
 	timeout     time.Duration
 	force       bool
 	noSandbox   bool
+	sandboxMode string
 	jsonOut     bool
 }
 
@@ -274,6 +282,7 @@ func parseUpFlags(argv []string) (*upOptions, error) {
 	seconds := flags.Int("timeout", 180, "boot timeout in seconds")
 	flags.BoolVar(&opts.force, "force", false, "reinstall node and dsh")
 	flags.BoolVar(&opts.noSandbox, "no-sandbox", false, "default new sessions to the danger-full-access policy (no sandbox wrapper, no approvals)")
+	flags.StringVar(&opts.sandboxMode, "sandbox-runner", sandboxRunnerNative, "sandbox backend: native (DSH's bwrap/landlock chain), auto, or bwrap-noproc (adapter for hosts that cannot mount a fresh /proc in a user namespace)")
 	flags.BoolVar(&opts.jsonOut, "json", false, "print one JSON result object")
 
 	if err := flags.Parse(argv); err != nil {
@@ -364,8 +373,13 @@ func cmdUp(argv []string) error {
 		_, wantsTunnel = dependencies[pikoRemotePackage]
 	}
 
+	sandbox, err := resolveSandboxRunner(log, opts.sandboxMode, 5*time.Second)
+	if err != nil {
+		return err
+	}
+
 	args := []string{"--profile", opts.profile}
-	if wantsTunnel {
+	if wantsTunnel || sandbox != nil {
 		overlayPath := filepath.Join(opts.dataDir, "piko-remote.overlay.yml")
 		overlay, err := renderOverlay(overlayConfig{
 			Remote:            opts.remote,
@@ -380,7 +394,7 @@ func cmdUp(argv []string) error {
 			DefaultTTLMinutes: opts.ttlMinutes,
 			CredentialsFile:   opts.credentials,
 			Endpoint:          opts.endpoint,
-		})
+		}, sandbox)
 		if err != nil {
 			return err
 		}
@@ -390,13 +404,16 @@ func cmdUp(argv []string) error {
 		if err := os.WriteFile(overlayPath, overlay, 0o600); err != nil {
 			return fmt.Errorf("write overlay: %w", err)
 		}
-		log.info("wrote tunnel overlay %s", overlayPath)
+		log.info("wrote overlay %s", overlayPath)
 
-		if err := ensureHelperBinary(log, opts.profile, pikoRemotePackage); err != nil {
-			return err
+		if wantsTunnel {
+			if err := ensureHelperBinary(log, opts.profile, pikoRemotePackage); err != nil {
+				return err
+			}
 		}
 		args = append(args, "--patch", overlayPath)
-	} else {
+	}
+	if !wantsTunnel {
 		log.warn("profile has no %s; starting DSH without tunnel configuration", pikoRemotePackage)
 	}
 

@@ -195,7 +195,7 @@ func TestRenderOverlay(t *testing.T) {
 		AutoExpose:        true,
 		DefaultTTLMinutes: 480,
 		CredentialsFile:   "/home/u/.local/share/dsh-piko-remote/access.json",
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +216,7 @@ func TestRenderOverlay(t *testing.T) {
 	if strings.Contains(text, "endpoint:") {
 		t.Errorf("an unset endpoint should be omitted:\n%s", text)
 	}
-	withEndpoint, err := renderOverlay(overlayConfig{Endpoint: "dsh-demo"})
+	withEndpoint, err := renderOverlay(overlayConfig{Endpoint: "dsh-demo"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -725,7 +725,7 @@ func TestOverlayCarriesFixedCredentials(t *testing.T) {
 		BasicAuth:     true,
 		BasicAuthUser: "friddle",
 		BasicAuthPass: "sybran_20250807",
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -736,7 +736,7 @@ func TestOverlayCarriesFixedCredentials(t *testing.T) {
 
 	// Unset credentials must stay out of the overlay entirely, so the helper's
 	// random generation remains the default.
-	plain, err := renderOverlay(overlayConfig{Remote: "https://x", BasicAuth: true})
+	plain, err := renderOverlay(overlayConfig{Remote: "https://x", BasicAuth: true}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -863,5 +863,94 @@ func TestSatisfyPeersInstallsMissingPeer(t *testing.T) {
 	}
 	if len(runner.calls) != 0 {
 		t.Fatalf("a satisfied peer must not be reinstalled: %v", runner.calls)
+	}
+}
+
+func TestFilterBwrapProfileArgs(t *testing.T) {
+	got := filterBwrapProfileArgs([]string{
+		"--ro-bind", "/", "/",
+		"--dev", "/dev",
+		"--unshare-pid",
+		"--proc", "/proc",
+		"--die-with-parent",
+		"--tmpfs", "/tmp",
+		"--bind", "/work", "/work",
+		"--",
+		"/bin/bash", "-c", "--unshare-pid --proc /proc",
+	})
+	want := []string{
+		"--ro-bind", "/", "/",
+		"--dev", "/dev",
+		"--die-with-parent",
+		"--tmpfs", "/tmp",
+		"--bind", "/work", "/work",
+		"--",
+		"/bin/bash", "-c", "--unshare-pid --proc /proc",
+	}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("filtered profile = %v, want %v", got, want)
+	}
+
+	// Everything after `--` belongs to the command and must survive verbatim.
+	tail := filterBwrapProfileArgs([]string{"--", "--unshare-pid", "--proc", "/proc"})
+	if strings.Join(tail, " ") != "-- --unshare-pid --proc /proc" {
+		t.Fatalf("command arguments were rewritten: %v", tail)
+	}
+}
+
+func TestResolveSandboxRunner(t *testing.T) {
+	if runner, err := resolveSandboxRunner(testLogger(), sandboxRunnerNative, time.Second); err != nil || runner != nil {
+		t.Fatalf("native = %v, %v; want the built-in chain untouched", runner, err)
+	}
+	if _, err := resolveSandboxRunner(testLogger(), "bwrap-noproc-lol", time.Second); err == nil {
+		t.Fatal("an unknown mode must be refused")
+	}
+	// `auto` only installs the adapter when bwrap runs the reduced profile but
+	// not DSH's own; on a host without bwrap it must stay out of the way.
+	if runner, err := resolveSandboxRunner(testLogger(), sandboxRunnerAuto, time.Second); err != nil {
+		t.Fatalf("auto: %v", err)
+	} else if runner != nil {
+		if len(runner.Command) != 2 || runner.Command[1] != sandboxRunnerSubcommand {
+			t.Fatalf("auto adapter = %v", runner)
+		}
+	}
+}
+
+func TestAdapterRunnerKeepsDSHSignatures(t *testing.T) {
+	runner, err := adapterRunner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.FailureSignatures) == 0 {
+		t.Fatal("a custom runner needs failure signatures: DSH rejects the row without them")
+	}
+	// The denial text bwrap prints for a blocked write must stay recognizable;
+	// DSH's own list for a custom runner is fixed, so only the fatal list is ours.
+	if strings.Join(runner.FailureSignatures, " ") != "bwrap: " {
+		t.Fatalf("failure signatures = %v", runner.FailureSignatures)
+	}
+}
+
+func TestRenderOverlayAddsTheSandboxAdapter(t *testing.T) {
+	body, err := renderOverlay(overlayConfig{Remote: "https://x"}, &sandboxRunner{
+		Command:           []string{"/opt/dsh-piko-remote", sandboxRunnerSubcommand},
+		FailureSignatures: []string{"bwrap: "},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	for _, want := range []string{
+		"id: piko-remote",
+		"id: sandbox",
+		"runnerCommand:",
+		"- /opt/dsh-piko-remote",
+		"- sandbox-runner",
+		"runnerFailureSignatures:",
+		"- 'bwrap: '",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("overlay is missing %q:\n%s", want, text)
+		}
 	}
 }

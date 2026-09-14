@@ -471,13 +471,29 @@ type overlayConfig struct {
 	Endpoint          string `yaml:"endpoint,omitempty"`
 }
 
-// renderOverlay renders the boot overlay.
-func renderOverlay(config overlayConfig) ([]byte, error) {
-	body, err := yaml.Marshal([]overlayRow{{ID: "piko-remote", Config: config}})
+// overlaySandboxRow routes confinement through an operator-supplied runner. DSH
+// replaces a targeted row's whole config, so the row restates every key the
+// adapter owns; the omitted ones keep their schema defaults.
+type overlaySandboxRow struct {
+	ID     string        `yaml:"id"`
+	Config sandboxRunner `yaml:"config"`
+}
+
+// renderOverlay renders the boot overlay. adapter, when non-nil, is the sandbox
+// runner resolved from --sandbox-runner.
+func renderOverlay(config overlayConfig, adapter *sandboxRunner) ([]byte, error) {
+	rows := []any{overlayRow{ID: "piko-remote", Config: config}}
+	if adapter != nil {
+		rows = append(rows, overlaySandboxRow{ID: "sandbox", Config: *adapter})
+	}
+	body, err := yaml.Marshal(rows)
 	if err != nil {
 		return nil, err
 	}
 	header := "# Written by dsh-piko-remote. Applied as a --patch overlay at boot;\n" +
 		"# the profile's own cordis.patch.yml is left untouched.\n"
+	if adapter != nil {
+		header += "# The sandbox row runs bwrap through this launcher: same file policy, no PID namespace.\n"
+	}
 	return append([]byte(header), body...), nil
 }

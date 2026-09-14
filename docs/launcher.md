@@ -87,6 +87,7 @@ dsh-piko-remote up --json                # 给脚本用：stdout 只有一行 JS
 | `--dsh-home DIR` | `$DSH_HOME` 或 `~/.dsh` | DSH home |
 | `--registry URL` | 用户 npm 配置 | 安装时用的 registry |
 | `--timeout SECONDS` | `180` | 等待启动的超时 |
+| `--sandbox-runner MODE` | `native` | `native` = 用 DSH 自己的 bwrap/landlock 链；`bwrap-noproc` = 用启动器自己做适配器（保留 `--ro-bind` 等文件策略，只去掉 `--unshare-pid --proc /proc`）；`auto` = 先探测，只有「完整 profile 不行、去掉这个组合行」时才装适配器 |
 | `--no-sandbox` | `false` | 新会话默认用 `danger-full-access`：命令不加沙箱包装、审批也关掉。等价于 `--env DSH_PERMISSION_MODE=danger-full-access`；调用方自己指定了 `DSH_PERMISSION_MODE` 时不覆盖（只 warn） |
 | `--force` | `false` | 强制重装 node 与 dsh |
 
@@ -99,6 +100,19 @@ dsh-piko-remote up --json                # 给脚本用：stdout 只有一行 JS
 而 `fs-sandbox` / `api-workspace-files` / deliverables 界面都注入 `sandboxPolicy`。
 各层控制点、以及宿主需要什么能力（`bwrap` 的 PID namespace + `/proc`，或启用了
 `landlock` 的 LSM）见 [README 的「沙箱与权限」](../README.md#沙箱与权限命令到底怎么跑)。
+
+容器里两条链都跑不起来时，还有第三条路——**沙箱适配器**：DSH 的 `sandbox` 行支持
+`runnerCommand`，而它会拿到和 bwrap 一模一样的 profile 参数，所以启动器可以自己当这个
+runner，把 `--unshare-pid --proc /proc` 这两项过滤掉再 exec bwrap：
+
+```bash
+dsh-piko-remote up --sandbox-runner bwrap-noproc   # 或 auto
+```
+
+文件策略（`--ro-bind / /`、`--dev /dev`、`--tmpfs /tmp`、`--bind <workdir>`）原样保留，
+所以「工作区外不可写」依然成立（实测写 `/etc` 得到 `Read-only file system`，DSH 也能正确
+识别成沙箱拒绝）；丢掉的是 PID namespace 隔离——被沙箱的命令本来就和 DSH 同用户，
+杀掉 DSH 进程这件事不需要靠 PID 隔离来防。适配器走 `syscall.Exec`，不额外留一层进程。
 
 ## 安全
 
