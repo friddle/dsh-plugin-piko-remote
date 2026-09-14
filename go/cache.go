@@ -238,6 +238,19 @@ func parseRange(header string, size int64) (start, end int64, ok bool) {
 	}
 }
 
+// isUpgrade reports whether the request asks to switch protocols.
+func isUpgrade(r *http.Request) bool {
+	if r.Header.Get("Upgrade") != "" {
+		return true
+	}
+	for _, value := range r.Header.Values("Connection") {
+		if strings.Contains(strings.ToLower(value), "upgrade") {
+			return true
+		}
+	}
+	return false
+}
+
 // acceptsGzip reports whether the client asked for gzip.
 func acceptsGzip(r *http.Request) bool {
 	for _, value := range r.Header.Values("Accept-Encoding") {
@@ -421,6 +434,14 @@ func withResponseCache(next http.Handler, cache *responseCache) http.Handler {
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// Protocol upgrades and event streams must never be buffered. An upgrade
+		// needs the ResponseWriter's Hijacker to take over the connection, which
+		// a buffering writer cannot provide: catching it here would break the
+		// DSH client's live stream.
+		if isUpgrade(r) || strings.HasPrefix(r.Header.Get("Accept"), "text/event-stream") {
 			next.ServeHTTP(w, r)
 			return
 		}

@@ -131,6 +131,54 @@ func TestCacheAddsContentLengthAndReusesTheBody(t *testing.T) {
 	}
 }
 
+func TestCacheLeavesUpgradesAndStreamsAlone(t *testing.T) {
+	var hits int32
+	var sawWriter string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		// A hijack is what a real WebSocket handler does; the point is that the
+		// writer must still support it.
+		if _, ok := w.(http.Hijacker); ok {
+			sawWriter = "hijackable"
+		} else {
+			sawWriter = "buffered"
+		}
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.WriteHeader(http.StatusSwitchingProtocols)
+	}))
+	defer upstream.Close()
+
+	handler, err := newHandler(proxyConfig{
+		target:       strings.TrimPrefix(upstream.URL, "http://"),
+		preserveHost: true,
+		cache:        newResponseCache(1<<20, 1<<20),
+	})
+	if err != nil {
+		t.Fatalf("newHandler: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "https://ep.example/api/remote.mux", nil)
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if sawWriter != "hijackable" {
+		t.Fatalf("upgrade request reached the proxy through a %s writer", sawWriter)
+	}
+	if atomic.LoadInt32(&hits) != 1 {
+		t.Fatalf("upstream hits = %d, want 1", hits)
+	}
+
+	// An event stream is also unusable if buffered.
+	stream := httptest.NewRequest(http.MethodGet, "https://ep.example/events", nil)
+	stream.Header.Set("Accept", "text/event-stream")
+	handler.ServeHTTP(httptest.NewRecorder(), stream)
+	if sawWriter != "hijackable" {
+		t.Fatal("event stream should not be buffered either")
+	}
+}
+
 func TestCacheServesRanges(t *testing.T) {
 	body := "0123456789"
 	upstream, _ := cacheFixture(t, body, http.Header{
