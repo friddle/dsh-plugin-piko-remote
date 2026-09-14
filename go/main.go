@@ -77,6 +77,9 @@ type options struct {
 	authPass     string
 	preserveHost bool
 	autoExitMin  int
+	cacheMaxMB   int
+	cacheTotalMB int
+	noCache      bool
 	jsonOut      bool
 	urlMode      string
 	localAddr    string
@@ -114,12 +117,21 @@ func run(opts options, rep *reporter) error {
 	ctx, cancel := context.WithCancel(signalCtx)
 	defer cancel()
 
+	var cache *responseCache
+	if !opts.noCache {
+		cache = newResponseCache(
+			int64(opts.cacheMaxMB)*1024*1024,
+			int64(opts.cacheTotalMB)*1024*1024,
+		)
+	}
+
 	handler, err := newHandler(proxyConfig{
 		target:       opts.target,
 		stripPrefix:  opts.stripPrefix,
 		preserveHost: opts.preserveHost,
 		authUser:     opts.authUser,
 		authPass:     opts.authPass,
+		cache:        cache,
 	})
 	if err != nil {
 		return err
@@ -224,6 +236,9 @@ flags:
   --auth-pass PASS      default: random; empty disables auth
   --preserve-host       forward the browser Host instead of rewriting it (default true)
   --auto-exit MINUTES   exit after this long; 0 never exits (default 0)
+  --cache-max-mb MB     largest response to buffer and re-serve (default 64)
+  --cache-total-mb MB   total response cache budget (default 256)
+  --no-cache            disable the response cache
   --local-addr ADDR     additionally serve the tunnel on a local address (debug)
   --insecure            skip TLS verification of the piko server (debug)
   --json                print one JSON event per line
@@ -243,6 +258,9 @@ flags:
 	fs.StringVar(&opts.authPass, "auth-pass", "", "Basic Auth password")
 	fs.BoolVar(&opts.preserveHost, "preserve-host", true, "forward the browser Host")
 	fs.IntVar(&opts.autoExitMin, "auto-exit", 0, "exit after this many minutes")
+	fs.IntVar(&opts.cacheMaxMB, "cache-max-mb", 64, "largest response to buffer for re-serving")
+	fs.IntVar(&opts.cacheTotalMB, "cache-total-mb", 256, "total response cache budget")
+	fs.BoolVar(&opts.noCache, "no-cache", false, "disable the response cache")
 	fs.StringVar(&opts.localAddr, "local-addr", "", "extra local debug listener")
 	fs.BoolVar(&opts.insecure, "insecure", false, "skip piko server TLS verification")
 	fs.BoolVar(&opts.jsonOut, "json", false, "emit JSON events")

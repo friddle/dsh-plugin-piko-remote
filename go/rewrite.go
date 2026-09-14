@@ -38,6 +38,11 @@ type proxyConfig struct {
 	// empty authPass disables it.
 	authUser string
 	authPass string
+
+	// cache, when set, buffers cacheable GET responses so they are served with
+	// an accurate Content-Length (and Range support) instead of as an
+	// unframed stream that can be truncated invisibly.
+	cache *responseCache
 }
 
 // errNoTarget is returned when the proxy is built without a target address.
@@ -99,6 +104,9 @@ func newHandler(cfg proxyConfig) (http.Handler, error) {
 	}
 
 	var handler http.Handler = proxy
+	if cfg.cache != nil {
+		handler = withResponseCache(handler, cfg.cache)
+	}
 	if cfg.authPass != "" {
 		handler = basicAuth(handler, cfg.authUser, cfg.authPass)
 	}
