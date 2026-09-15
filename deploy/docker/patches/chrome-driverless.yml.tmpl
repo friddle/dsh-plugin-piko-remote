@@ -1,0 +1,14 @@
+# Chrome driverless row config for this deployment.
+#
+# The chrome-driverless *plugin* is baked into the web profile; this overlay only
+# points it at the service that already runs in this cluster. There is no docker
+# socket inside the pod, so manageContainer stays off and the plugin is a pure
+# HTTP client of that service.
+#
+# entrypoint.sh substitutes @DSH_CHROME_BASE_URL@ into /tmp/dsh-patches/ and
+# passes the result as `dsh --profile web --patch …`.
+- id: chrome-driverless
+  config:
+    baseUrl: @DSH_CHROME_BASE_URL@
+    manageContainer: false
+    autoStart: false

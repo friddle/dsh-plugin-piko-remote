@@ -41,8 +41,11 @@ const defaultDshVersion = "0.1.5-rc.1"
 // defaultRemotePlugin is what `up` installs when no --plugin is given.
 const defaultRemotePlugin = "github:friddle/dsh-plugin-piko-remote"
 
-// defaultTTLMinutes keeps an exposed DSH UI from living forever by accident.
-const defaultTTLMinutes = 480
+// defaultTTLMinutes is deliberately 0: a tunnel that closes itself after a fixed
+// number of minutes is a trap for the thing this launcher exists for — an agent
+// host you come back to hours later. `--ttl MINUTES` opts into an expiry, and the
+// helper only receives `--auto-exit` when one is set.
+const defaultTTLMinutes = 0
 
 // defaultRemote is the public gotty-piko server.
 const defaultRemote = "https://clauded.friddle.me"
@@ -116,7 +119,8 @@ up flags:
   --profile NAME        DSH profile to create/use (default `+defaultProfileName+`)
   --remote URL          piko server (default `+defaultRemote+`)
   --endpoint NAME       fixed endpoint name; default: random per boot
-  --ttl MINUTES         tunnel lifetime (default `+fmt.Sprint(defaultTTLMinutes)+`; 0 = never expire)
+  --ttl MINUTES         tunnel lifetime; 0 (the default) means it stays until
+                        stopped, otherwise the helper auto-exits after N minutes
   --basic-auth          turn HTTP Basic Auth back on for the tunnel (default off:
                         the DSH ?token= fence is the credential — a per-boot launch
                         token exchanged for a 30-day signed HttpOnly cookie)

@@ -52,6 +52,7 @@ docker rm -f dsh-smoke >/dev/null 2>&1 || true
 # every loopback curl. Clear it so the test measures the image.
 docker run -d --name dsh-smoke \
 	-e "DSH_AUTH_USER=$SMOKE_USER" -e "DSH_AUTH_PASS=$SMOKE_PASS" \
+	-e "DSH_AUTH_TOKEN=$SMOKE_PASS" -e "DSH_AUTH_MODE=token" \
 	-e "DSH_TRUSTED_HOST=$INGRESS_HOST" \
 	-e http_proxy= -e https_proxy= -e HTTP_PROXY= -e HTTPS_PROXY= \
 	-e ALL_PROXY= -e NO_PROXY='*' \
@@ -76,33 +77,56 @@ done
 # fence is exercised too (the container was started with --trusted-host).
 HOST_HDR="Host: $INGRESS_HOST"
 CURL=(curl --noproxy '*' -s -H "$HOST_HDR")
-anon=$("${CURL[@]}" -o /dev/null -w '%{http_code}' "$BASE/")
-bounce=$("${CURL[@]}" -u "$SMOKE_USER:$SMOKE_PASS" -o /dev/null -w '%{http_code} %{redirect_url}' "$BASE/")
 jar="$(mktemp)"
 body="$(mktemp)"
-ui=$("${CURL[@]}" -L -c "$jar" -b "$jar" -u "$SMOKE_USER:$SMOKE_PASS" -o "$body" -w '%{http_code}' "$BASE/")
+
+# Browser navigation with no session: must redirect to the login page and must
+# NOT emit a Basic challenge (that is what made browsers prompt repeatedly).
+anon=$("${CURL[@]}" -H 'Accept: text/html' -o /dev/null -w '%{http_code} %{redirect_url}' "$BASE/")
+challenges=$("${CURL[@]}" -H 'Accept: text/html' -D - -o /dev/null "$BASE/" | tr -d '\r' | grep -ci '^www-authenticate:' || true)
+form=$("${CURL[@]}" -H 'Accept: text/html' -o "$body" -w '%{http_code}' "$BASE/__login")
+if grep -q 'name="token"' "$body"; then formok=yes; else formok=no; fi
+# Exchange the token for a signed session cookie, then use it.
+login=$("${CURL[@]}" -c "$jar" -b "$jar" -o /dev/null -w '%{http_code}' \
+	-X POST -d "token=$SMOKE_PASS" -d 'next=/' "$BASE/__login")
+ui=$("${CURL[@]}" -c "$jar" -b "$jar" -L -o "$body" -w '%{http_code}' "$BASE/")
 if grep -qiE '<div id="root"|<!doctype html' "$body"; then html=yes; else html=no; fi
-# After the cookie is established, the API must answer as a real API.
-api=$("${CURL[@]}" -b "$jar" -c "$jar" -u "$SMOKE_USER:$SMOKE_PASS" -o /dev/null -w '%{http_code}' "$BASE/api/state")
-ws=$("${CURL[@]}" -b "$jar" -u "$SMOKE_USER:$SMOKE_PASS" -o /dev/null -w '%{http_code}' \
+session=$(grep -c 'dsh_auth' "$jar" 2>/dev/null || true)
+api=$("${CURL[@]}" -b "$jar" -c "$jar" -o /dev/null -w '%{http_code}' "$BASE/api/state")
+api_anon=$("${CURL[@]}" -o /dev/null -w '%{http_code}' "$BASE/api/state")
+# Scripts hold only the login token: the proxy bootstraps dsh's own session
+# server-side, so Bearer must work on the first request with no cookie jar.
+bearer=$("${CURL[@]}" -H "Authorization: Bearer $SMOKE_PASS" -o "$body" -w '%{http_code}' "$BASE/")
+if grep -qiE '<div id="root"|<!doctype html' "$body"; then bearer_html=yes; else bearer_html=no; fi
+bearer_api=$("${CURL[@]}" -H "Authorization: Bearer $SMOKE_PASS" -o /dev/null -w '%{http_code}' "$BASE/api/state")
+ws=$("${CURL[@]}" -b "$jar" -o /dev/null -w '%{http_code}' --http1.1 \
 	-H 'Upgrade: websocket' -H 'Connection: Upgrade' \
 	-H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H 'Sec-WebSocket-Version: 13' \
 	"$BASE/api/remote.mux")
 tools=$(docker exec dsh-smoke bash -lc 'go version; git --version; kubectl version --client 2>/dev/null | head -1; mysqldump --version; node -v; vim --version | head -1' 2>&1)
 
 echo "--- smoke results ---"
-echo "no credentials        /          -> $anon      (want 401)"
-echo "credentials, no session /        -> $bounce  (want 303 + /?token=...)"
-echo "follow redirect, cookie jar /    -> $ui      (want 200, html=$html)"
-echo "session cookie   /api/state      -> $api     (want != 401)"
-echo "session cookie   WS upgrade      -> $ws      (want 101)"
+echo "no session   /            -> $anon   (want 303 + /__login)"
+echo "Basic challenge headers   -> $challenges   (want 0)"
+echo "GET /__login form         -> $form, token field=$formok   (want 200/yes)"
+echo "POST /__login token       -> $login   (want 303, cookie set=$session)"
+echo "session cookie  /         -> $ui, html=$html   (want 200/yes)"
+echo "session cookie  /api/state-> $api   (want != 401)"
+echo "no session      /api/state-> $api_anon   (want 401)"
+echo "Bearer only     /         -> $bearer, html=$bearer_html   (want 200/yes)"
+echo "Bearer only     /api/state-> $bearer_api   (want != 401)"
+echo "session cookie  WS upgrade-> $ws   (want 101)"
 echo "$tools"
 rm -f "$jar" "$body"
 
-[[ "$anon" == "401" ]] || { echo "!! expected 401 without credentials" >&2; docker logs dsh-smoke >&2; exit 1; }
-[[ "$bounce" == 303* ]] || { echo "!! expected the dsh token bootstrap redirect" >&2; docker logs dsh-smoke >&2; exit 1; }
-[[ "$bounce" == *"token="* ]] || { echo "!! bootstrap redirect carried no token" >&2; docker logs dsh-smoke >&2; exit 1; }
+[[ "$anon" == 303* && "$anon" == *"/__login"* ]] || { echo "!! expected a login redirect, got: $anon" >&2; docker logs dsh-smoke >&2; exit 1; }
+[[ "$challenges" == "0" ]] || { echo "!! a Basic challenge was sent — browsers would prompt" >&2; docker logs dsh-smoke >&2; exit 1; }
+[[ "$form" == "200" && "$formok" == "yes" ]] || { echo "!! login form not served" >&2; docker logs dsh-smoke >&2; exit 1; }
+[[ "$login" == "303" && "$session" != "0" ]] || { echo "!! token login did not set a session cookie" >&2; docker logs dsh-smoke >&2; exit 1; }
 [[ "$ui" == "200" && "$html" == "yes" ]] || { echo "!! authenticated UI did not load" >&2; docker logs dsh-smoke >&2; exit 1; }
+[[ "$api_anon" == "401" ]] || { echo "!! unauthenticated API should be 401" >&2; docker logs dsh-smoke >&2; exit 1; }
+[[ "$bearer" == "200" && "$bearer_html" == "yes" ]] || { echo "!! Bearer-only request did not reach dsh" >&2; docker logs dsh-smoke >&2; exit 1; }
+[[ "$ws" == "101" ]] || { echo "!! websocket with a session cookie should be 101" >&2; docker logs dsh-smoke >&2; exit 1; }
 
 echo "==> smoke test passed"
 cleanup

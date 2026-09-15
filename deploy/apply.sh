@@ -29,6 +29,11 @@ SSH_PORT="${SSH_PORT:-2222}"
 IN_CLUSTER_SERVER="${IN_CLUSTER_SERVER:-https://kubernetes.default.svc:443}"
 AUTH_USER="${AUTH_USER:-friddle}"
 AUTH_PASS="${AUTH_PASS:-}"
+# Login token for the proxy's own session cookie (see docker/auth-proxy.mjs).
+# Empty = reuse whatever is already in the cluster, else generate. Set it
+# explicitly to force a rotation.
+AUTH_TOKEN="${AUTH_TOKEN:-}"
+INGRESS_HOST="${INGRESS_HOST:-dsh-bi-interface.management.code27.co}"
 # DRY_RUN=1 rehearses the whole flow with client-side dry runs only.
 DRY_RUN="${DRY_RUN:-0}"
 
@@ -70,18 +75,21 @@ kubectl get ns "$NS" >/dev/null
 # StorageClass), so the directory must exist on the node it is pinned to —
 # keep PROJECT_DIR and deployment.yaml's nodeSelector/hostPath in sync.
 PROJECT_DIR="${PROJECT_DIR:-/root/data/project}"
-echo "==> hostPath target $PROJECT_DIR on $SSH_HOST"
-if [[ "$DRY_RUN" == "1" ]]; then
-	ssh -F /dev/null -p "$SSH_PORT" -o BatchMode=yes -o ConnectTimeout=15 "$SSH_HOST" \
-		"ls -ld '$PROJECT_DIR'" \
-		|| echo "    (dry run: $PROJECT_DIR does not exist yet on $SSH_HOST)"
-elif ssh -F /dev/null -p "$SSH_PORT" -o BatchMode=yes -o ConnectTimeout=15 "$SSH_HOST" \
-	"mkdir -p '$PROJECT_DIR' && chmod 0755 '$PROJECT_DIR' && ls -ld '$PROJECT_DIR'"; then
-	echo "    ok"
-else
-	echo "    !! could not create $PROJECT_DIR on $SSH_HOST — the pod will not start" >&2
-	exit 1
-fi
+DSH_HOME_DIR="${DSH_HOME_DIR:-/root/data/dsh-home}"
+for dir in "$PROJECT_DIR" "$DSH_HOME_DIR"; do
+	echo "==> hostPath target $dir on $SSH_HOST"
+	if [[ "$DRY_RUN" == "1" ]]; then
+		ssh -F /dev/null -p "$SSH_PORT" -o BatchMode=yes -o ConnectTimeout=15 "$SSH_HOST" \
+			"ls -ld '$dir'" \
+			|| echo "    (dry run: $dir does not exist yet on $SSH_HOST)"
+	elif ssh -F /dev/null -p "$SSH_PORT" -o BatchMode=yes -o ConnectTimeout=15 "$SSH_HOST" \
+		"mkdir -p '$dir' && chmod 0755 '$dir' && ls -ld '$dir'" >/dev/null; then
+		echo "    ok"
+	else
+		echo "    !! could not create $dir on $SSH_HOST — the pod will not start" >&2
+		exit 1
+	fi
+done
 
 # The Deployment is pinned to one node (deployment.yaml nodeSelector) because the
 # hostPath above is node-local. Catch a missing/renamed/cordoned node here rather
@@ -129,9 +137,22 @@ if [[ -z "$AUTH_PASS" ]]; then
 	echo "!! AUTH_PASS is empty; pass it explicitly, e.g. AUTH_PASS='...' $0" >&2
 	exit 1
 fi
-echo "==> secret/$APP-auth"
+
+# Keep the existing login token across re-applies: rotating it would log
+# everybody out. AUTH_TOKEN='...' forces a new one.
+if [[ -z "$AUTH_TOKEN" ]]; then
+	AUTH_TOKEN="$(kubectl -n "$NS" get secret "$APP-auth" -o jsonpath='{.data.token}' 2>/dev/null \
+		| base64 --decode 2>/dev/null || true)"
+fi
+TOKEN_SOURCE="reused from secret/$APP-auth"
+if [[ -z "$AUTH_TOKEN" ]]; then
+	AUTH_TOKEN="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')"
+	TOKEN_SOURCE="generated"
+fi
+echo "==> secret/$APP-auth (login token: $TOKEN_SOURCE)"
 kubectl -n "$NS" create secret generic "$APP-auth" \
 	--from-literal=username="$AUTH_USER" --from-literal=password="$AUTH_PASS" \
+	--from-literal=token="$AUTH_TOKEN" \
 	--dry-run=client -o yaml | apply_from_stdin
 
 echo "==> applying manifests"
@@ -153,5 +174,9 @@ kubectl -n "$NS" rollout status deployment/"$APP" --timeout=600s || {
 echo "==> done"
 kubectl -n "$NS" get pod,svc,ingress -l app.kubernetes.io/name="$APP" -o wide
 echo
-echo "URL:  https://dsh-bi-interface.management.code27.co"
-echo "user: $AUTH_USER"
+echo "打开下面这个链接登录一次（之后 30 天免登录，滑动续期）:"
+echo "  https://$INGRESS_HOST/?dsh_token=$AUTH_TOKEN"
+echo
+echo "Token 也可以随时再取："
+echo "  kubectl -n $NS get secret $APP-auth -o jsonpath='{.data.token}' | base64 -d; echo"
+echo "Basic Auth（仅 DSH_AUTH_MODE=both|basic 时可用）: user=$AUTH_USER"

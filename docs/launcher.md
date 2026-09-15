@@ -77,7 +77,7 @@ dsh-piko-remote up --json                # 给脚本用：stdout 只有一行 JS
 | `--profile NAME` | `dsh-piko` | DSH profile 名 |
 | `--remote URL` | `https://clauded.friddle.me` | piko 服务器 |
 | `--endpoint NAME` | 随机 | 固定 endpoint 名（例如要配合 `--trusted-host` 时） |
-| `--ttl MINUTES` | `480` | 隧道存活时间，`0` = 不过期 |
+| `--ttl MINUTES` | `0` | 隧道存活时间。**默认 0 = 不过期**：只有显式给值，helper 才会拿到 `--auto-exit N`。设了 TTL 的隧道到点会自己退出，公网地址随即变成 `404 no available upstreams`（DSH 本体不受影响） |
 | `--basic-auth` | `false` | 隧道 HTTP Basic Auth。**默认关**：DSH 自带的 `?token=` 围栏才是真正的凭证（启动 token → 30 天签名 cookie，`HttpOnly; SameSite=Strict`，密钥持久化）。打开就是加第二层，账号可用 `--auth-user/--auth-pass` 固定 |
 | `--expose-dsh-ui` | `true` | 允许暴露 DSH 自己的界面；关掉则只装插件不暴露 |
 | `--credentials-file F` | `<data-dir>/access.json` | 隧道地址与账号密码落盘位置（0600） |

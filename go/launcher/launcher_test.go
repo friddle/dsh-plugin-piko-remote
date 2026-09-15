@@ -1060,3 +1060,24 @@ func TestBasicAuthDefaultsOff(t *testing.T) {
 		t.Fatalf("unexpected options: %+v", opts)
 	}
 }
+
+func TestTTLDefaultsToNeverExpire(t *testing.T) {
+	// A tunnel that closes itself after a fixed number of minutes turns a host
+	// you come back to later into a 404 with no server-side trace, which is
+	// exactly what happened in production. Expiry is opt-in.
+	opts, err := parseUpFlags(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.ttlMinutes != 0 {
+		t.Fatalf("default ttl = %d, want 0 (never expire)", opts.ttlMinutes)
+	}
+
+	opts, err = parseUpFlags([]string{"--ttl", "60"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.ttlMinutes != 60 {
+		t.Fatalf("--ttl 60 = %d", opts.ttlMinutes)
+	}
+}

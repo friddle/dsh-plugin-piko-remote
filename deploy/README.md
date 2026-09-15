@@ -13,7 +13,7 @@
 - 上游只有一个 *Idea: official Docker image / containerized deployment* 的讨论，
   也就是说「容器化」目前是社区自己做的事。
 
-**2. DSH web 支持账号密码吗？不支持，但有一层每次启动随机的 token 鉴权。**
+**2. DSH web 支持账号密码吗？不支持；它只有每次启动随机生成的 token。**
 
 实测 `@deepseek-ai/dsh@0.1.5-rc.1`：
 
@@ -28,20 +28,70 @@
   `error: --host 0.0.0.0 is intentionally not supported yet for safety: it would
   expose remote code execution to the network`。
 
-所以本镜像叠两层：
+所以本镜像叠两层，**两层都是 token，没有 HTTP Basic 弹窗**：
 
 ```
-ingress ─► auth-proxy :8080 ─► dsh web 127.0.0.1:3080
-           │ Basic Auth（固定账号密码，给人用）
-           └ 捕获 dsh 的 boot token；文档请求被 dsh 401 时透明 303 到 /?token=…
+浏览器 ─► auth-proxy :8080 ─► dsh web 127.0.0.1:3080
+          │ ① 自己的登录 token → 签名 HttpOnly Cookie（30 天，滑动续期）
+          └ ② 捕获 dsh 的 boot token；文档请求被 dsh 401 时透明 303 到 /?token=…
 ```
 
-`docker/auth-proxy.mjs`（零依赖）负责：Basic Auth 校验 → 原样转发（保留原始
-Host，给 dsh 的 browser-trust fence 看）→ 遇到 dsh 的 401 且是文档导航
-（`/` 或 `Accept: text/html`）就跳到 `/?token=<token>`，浏览器拿到 cookie 后就正常了；
-`/api/*` 与 WebSocket 升级不做重定向，保持真实状态码。
-`entrypoint.sh` 从 dsh 的启动输出里抓这个 token，并把它作为 `DSH_WEB_TOKEN`
-交给反代。
+① 是给人用的：**只登录一次**。② 是 dsh 自己每次重启都会换的 session token，
+由 `entrypoint.sh` 从启动日志里抓出来交给反代，人不用管。
+
+> 为什么不用 Basic Auth：浏览器不会像人期望的那样"记住"Basic —— 任何 XHR /
+> WebSocket 的 401 都可能再弹一次框，SPA 场景下就是"每个页面都问一次"。
+> 所以默认 `DSH_AUTH_MODE=token`：不发 `WWW-Authenticate`，未登录的文档请求
+> 直接 303 到登录页；Basic 只作为可选的脚本后门保留（`both` / `basic`）。
+
+## 登录方式（token + Cookie 会话）
+
+| 项 | 值 |
+| --- | --- |
+| 登录 token | Secret `dsh-bi-interface-auth` 的 `token` 键（`apply.sh` 首次随机生成，之后复用不轮换） |
+| 会话 | `dsh_auth=v1.<exp>.<HMAC>` 签名 Cookie，`HttpOnly` + `SameSite=Lax`（https 时加 `Secure`） |
+| 有效期 | `DSH_SESSION_TTL`，默认 30 天；**滑动续期**（过半 TTL 后自动续，常用就不用再登） |
+| 退出 | `https://<host>/__logout` |
+| 登录页 | `https://<host>/__login`（只输 token 一个框） |
+| 一次性登录链接 | `https://<host>/?dsh_token=<token>`（登录后立刻把参数从 URL 抹掉并 303） |
+
+dsh 那一层的引导是**反代在服务端做的**：反代启动后按需用 `Host`（authority）去
+`dsh web` 换一次它自己的 `dsh-auth-<random>` 会话 cookie，缓存起来注入后续请求。
+好处是浏览器地址栏永远不出现 dsh 的 `?token=`，`-H "Authorization: Bearer <token>"`
+这类脚本也能**首跳就拿到 200**（不需要 cookie jar 跟跳转）。
+
+⚠️ 踩过的坑：**dsh 的会话是按 authority 签名的**（cookie payload 里带
+`"authority":"<host>"`），所以引导时必须用客户端真实的 Host——用 `Host: 127.0.0.1`
+去引导再注入给 `Host: <域名>` 的请求会全部 401。反代因此按 authority 建 Map 缓存
+（单测的假上游也照这个语义实现，否则测不出这类问题）。
+
+```bash
+# 取 token
+kubectl -n management get secret dsh-bi-interface-auth -o jsonpath='{.data.token}' | base64 -d; echo
+
+# 脚本用法（不再需要 -u）
+TOKEN=$(kubectl -n management get secret dsh-bi-interface-auth -o jsonpath='{.data.token}' | base64 -d)
+curl -H "Authorization: Bearer $TOKEN" https://dsh-bi-interface.management.code27.co/       # 200
+wget --header="Authorization: Bearer $TOKEN" -O /tmp/ui.html https://dsh-bi-interface.management.code27.co/
+# 或者换一次 cookie 然后复用 jar
+curl -sL -c /tmp/jar -b /tmp/jar "https://dsh-bi-interface.management.code27.co/?dsh_token=$TOKEN"
+```
+
+轮换 token（会让所有人重新登录）：
+
+```bash
+AUTH_PASS='<密码>' AUTH_TOKEN="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')" ./deploy/apply.sh
+```
+
+模式（`DSH_AUTH_MODE`，在 `k8s/deployment.yaml` 里）：
+
+| 模式 | 行为 |
+| --- | --- |
+| `token`（默认） | 只认 Cookie / `Authorization: Bearer`；没有任何 HTTP auth，**永远不会弹窗** |
+| `both` | 再加上 Basic（给 `curl -u`；curl 是抢先发送凭据的），仍不发 challenge |
+| `basic` | 旧行为：所有请求都 Basic challenge（只有 `wget --user/--password` 这类非要 challenge 的客户端才需要） |
+| `off` | 完全不鉴权（前面已有别的网关时） |
+
 
 ## 镜像内容
 
@@ -84,7 +134,7 @@ web profile 在**构建期**就 `dsh --profile web --dump-config` 预热好了�
 反代那层不依赖 Docker，可以直接在本机跑单元验证：
 
 ```bash
-node .build/proxy-test.mjs   # 12 项：401/200、Host 透传、healthz、WS 升级、token bootstrap
+node .build/proxy-test.mjs   # 23 项：登录/会话/过期/篡改/模式差异/Host 透传/WS/dsh token bootstrap
 ```
 
 ## 目录
@@ -93,7 +143,7 @@ node .build/proxy-test.mjs   # 12 项：401/200、Host 透传、healthz、WS 升
 deploy/
 ├── docker/
 │   ├── Dockerfile        镜像定义（工具链 + dsh）
-│   ├── auth-proxy.mjs    Basic Auth + dsh token bootstrap + WebSocket 反代（0 依赖）
+│   ├── auth-proxy.mjs    token→Cookie 会话 + dsh token bootstrap + WebSocket 反代（0 依赖）
 │   └── entrypoint.sh     播种凭据 → 起 dsh(loopback) → 抓 token → 起反代
 ├── k8s/
 │   ├── deployment.yaml   Deployment（无 Secret 明文，只引用名字）
@@ -115,8 +165,9 @@ PUSH=0 ./deploy/build.sh       # 只构建 + 冒烟，不推
 
 | 请求 | 期望 |
 | --- | --- |
-| `/` 不带账号 | `401` |
-| `/` 带账号、无 dsh session | `303` + `Location: /?token=…` |
+| `/` 无会话（浏览器导航） | `303` → `/__login`，且**不发 Basic challenge** |
+| `GET /__login` | `200` 登录表单 |
+| `POST /__login` 正确 token | `303` + `Set-Cookie: dsh_auth=v1.…` |
 | 跟随跳转 + cookie jar | `200`，正文是 SPA HTML |
 | 带 session 请求 `/api/state` | 非 401（session 生效） |
 | 带 session 的 WebSocket 升级 | `101` |
@@ -136,7 +187,7 @@ PUSH=0 ./deploy/build.sh       # 只构建 + 冒烟，不推
 | `dsh-bi-interface-kubeconfig` | `~/bin/ssh_bi`（`root@47.90.211.213:2222`）的 `/root/.kube/config`，server 改写成 `https://kubernetes.default.svc:443` | `/root/.kube/config` | 容器内 `kubectl` 直接用（admin 客户端证书 + CA 都在里面，集群内 apiserver 证书含 `kubernetes.default.svc` SAN，校验通过） |
 | `dsh-bi-interface-ssh` | `~/.ssh/{id_ed25519,id_ed25519.pub,config,known_hosts}` | `/root/.ssh`（`defaultMode: 0600`） | git over ssh / ssh 跳板 |
 | `dsh-bi-interface-dsh-credentials` | `~/.dsh/{.credentials.yaml,settings.yaml}` | `/etc/dsh-credentials`，entrypoint 拷进 `$DSH_HOME` | 容器里的 dsh 真能调模型（`DEEPSEEK_API_KEY` 等） |
-| `dsh-bi-interface-auth` | `AUTH_USER` / `AUTH_PASS` | 环境变量 | Basic Auth 账号密码 |
+| `dsh-bi-interface-auth` | `AUTH_USER` / `AUTH_PASS` / `AUTH_TOKEN`（apply.sh 生成，复用不轮换） | 环境变量（`token` 键 = 登录 token） | Cookie 会话的登录 token；user/pass 仅 `both`/`basic` 模式用 |
 
 注意 kubeconfig 挂的是 **ssh_bi 那台机器上的** admin 配置（`172.18.0.1:6443`，
 就是这台 bi 控制面），不是本机 `~/.kube/config` —— 后者指向本地 orbstack，
@@ -161,7 +212,7 @@ AUTH_PASS='<密码>' ./deploy/apply.sh             # 真正应用
 - Ingress：`dsh-bi-interface.management.code27.co`（`nginx` class，
   `cert-manager.io/cluster-issuer: letsencrypt-cloudflare-issuer`，
   TLS secret `dsh-bi-interface-management-tls`，WS 超时 3600s）
-- 账号：`friddle`
+- 登录：`?dsh_token=<token>` 或 `/__login` 输 token（`both`/`basic` 模式下 `friddle` + 密码仍可用）
 - `*.management.code27.co` 的 A 记录已存在（指向 `10.10.32.12`），不用另外配 DNS
 
 ## 验证
@@ -172,10 +223,11 @@ kubectl --kubeconfig ~/.kube/config_bi -n management logs deploy/dsh-bi-interfac
 cert=$(kubectl --kubeconfig ~/.kube/config_bi -n management get certificate dsh-bi-interface-management-tls -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
 echo "cert ready=$cert"
 
-# 不带账号 -> 401；带账号 -> 303 到 /?token=…，跟随后 200
-curl -s -o /dev/null -w '%{http_code}\n' https://dsh-bi-interface.management.code27.co/
-curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' -u friddle:'<密码>' https://dsh-bi-interface.management.code27.co/
-curl -sL -c /tmp/jar -b /tmp/jar -o /dev/null -w '%{http_code}\n' -u friddle:'<密码>' https://dsh-bi-interface.management.code27.co/
+# 无会话 -> 303 到登录页；用 token 换 cookie 后 -> 200
+TOKEN=$(kubectl --kubeconfig ~/.kube/config_bi -n management get secret dsh-bi-interface-auth -o jsonpath='{.data.token}' | base64 -d)
+curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' https://dsh-bi-interface.management.code27.co/          # 303 /__login
+curl -sL -c /tmp/jar -b /tmp/jar -o /dev/null -w '%{http_code}\n' "https://dsh-bi-interface.management.code27.co/?dsh_token=$TOKEN"   # 200
+curl -s -H "Authorization: Bearer $TOKEN" -o /dev/null -w '%{http_code}\n' https://dsh-bi-interface.management.code27.co/            # 200
 
 # 容器里的工具链 + kubeconfig 是否真的通
 kubectl --kubeconfig ~/.kube/config_bi -n management exec deploy/dsh-bi-interface -- \
@@ -188,23 +240,25 @@ kubectl --kubeconfig ~/.kube/config_bi -n management exec deploy/dsh-bi-interfac
 
 | 请求 | 结果 |
 | --- | --- |
-| `/` 不带凭据 | `401`（反代的 Basic Auth） |
-| `/` 带账号密码 | `303 → /?token=…`，跟随后 `200` + SPA（27724 bytes） |
-| `/?token=…` 带账号密码（wget/curl） | `200` + SPA |
-| 带 session 的 `/api/*` | 非 401（session 生效） |
+| `/` 无会话（浏览器） | `303` → `/__login`，响应里**没有** `WWW-Authenticate`（不会再弹框） |
+| `/?dsh_token=<token>` | `303`（抹掉参数、下发 Cookie）→ 跟随后 `200` + SPA |
+| `Authorization: Bearer <token>` | `200` |
+| 无会话的 `/api/*` | `401` JSON（不是 challenge） |
 | 带 session 的 `/api/remote.mux` WebSocket | `101 Switching Protocols`（穿过外层网关 + ingress） |
 | 不带 session 的 WebSocket | `401` |
 
-```
-# 两条都能拿到 SPA；带账号密码就够了，token 反代自己会引导
-wget -O /tmp/ui.html --user=friddle --password='<密码>' https://dsh-bi-interface.management.code27.co/
-wget -O /tmp/ui.html --user=friddle --password='<密码>' "https://dsh-bi-interface.management.code27.co/?token=<token>"
-curl -sL -c /tmp/jar -b /tmp/jar -u friddle:'<密码>' https://dsh-bi-interface.management.code27.co/
+```bash
+TOKEN=$(kubectl --kubeconfig ~/.kube/config_bi -n management get secret dsh-bi-interface-auth -o jsonpath='{.data.token}' | base64 -d)
+# 浏览器：打开下面这个链接登录一次（30 天滑动续期）；或打开 / 走登录表单
+echo "https://dsh-bi-interface.management.code27.co/?dsh_token=$TOKEN"
+# 脚本
+curl -H "Authorization: Bearer $TOKEN" -o /tmp/ui.html https://dsh-bi-interface.management.code27.co/
+wget --header="Authorization: Bearer $TOKEN" -O /tmp/ui.html https://dsh-bi-interface.management.code27.co/
 ```
 
-注意：**`?token=` 不是替代账号密码的东西**。它是 dsh 自己的 per-boot session token
-（每次重启都变，见 `kubectl logs` 里 `dsh web: http://…/?token=…`），单独拿它访问
-会在反代这层被 `401` 挡掉；带上账号密码后，token 由反代自动完成引导。
+注意区分两个 token：**`dsh_token` 是给人用的登录 token**（稳定，存在 Secret 里）；
+dsh 启动日志里的 `?token=` 是它自己的 per-boot session token（每次重启都变），
+由 entrypoint 抓给反代，人不需要也不应该用它。
 
 ### 如果哪天又变成不可达（历史现象，留作排障参考）
 
@@ -227,10 +281,10 @@ LibreSSL: error:1404B458:SSL routines:ST_CONNECT:tlsv1 unrecognized name
 kubectl --kubeconfig ~/.kube/config_bi -n management exec deploy/dsh-bi-interface -- \
   curl -sk -o /dev/null -w '%{http_code}\n' \
   --resolve dsh-bi-interface.management.code27.co:443:10.106.177.237 \
-  https://dsh-bi-interface.management.code27.co/     # 期望 401
+  https://dsh-bi-interface.management.code27.co/     # 期望 303（跳登录页）
 ```
 
-返回 401 就说明 ingress/证书/后端都正常，问题在集群外那一跳。
+返回 303/200 就说明 ingress/证书/后端都正常，问题在集群外那一跳。
 
 
 ## 工作区 / 持久化（节点本地目录）
@@ -282,17 +336,108 @@ kubectl -n management exec deploy/dsh-bi-interface -- ssh -o BatchMode=yes -T gi
 要换 key：改 `~/.ssh/id_ed25519` 后重跑 `apply.sh`（会重建 `-ssh` Secret），
 再 `kubectl rollout restart deploy/dsh-bi-interface`。
 
+## 插件：chrome-driverless（浏览器自动化）
+
+镜像里**预装了** `dsh-plugin-chrome-driverless`（构建期 `dsh plugin --profile web add
+github:friddle/dsh-plugin-chrome-driverless#v0.1.0`），Pod 起来就能用，不需要联网装。
+
+BI 集群里已经有一个 chrome 服务（`deployment/chrome-driverless-mp2`，19 天），所以插件
+**只做 HTTP 客户端**，自己不建容器（Pod 里没有 docker socket）：
+
+| 项 | 值 |
+| --- | --- |
+| 服务 | `chrome-driverless-mp2.management.svc.cluster.local`（`/health` → `{"status":"ok"}`，Pod 内 21ms） |
+| 插件配置 | `baseUrl=<上面的服务>`、`manageContainer: false`、`autoStart: false` |
+| 配置怎么传 | `deploy/docker/patches/chrome-driverless.yml.tmpl` → entrypoint 启动时渲染到 `/tmp/dsh-patches/chrome-driverless.yml`，以 `dsh --profile web --patch …` 传入 |
+| 换服务地址 | 改 Deployment 的 `DSH_CHROME_BASE_URL` 即可，**不用重建镜像**（entrypoint 每次启动重新渲染） |
+| 升级插件版本 | `TAG=0.7.0 CHROME_PLUGIN_SPEC='github:friddle/dsh-plugin-chrome-driverless#v0.2.0' ./deploy/build.sh` |
+
+三个必须注意的点（都是踩过的坑）：
+
+1. **必须用 `dsh --profile web --patch … <app flags>`，不能用 `dsh web --patch …`**：
+   后者会报 `error: web takes none of parent --profile, --from-default-profile, --patch, …`。
+2. **不能让 profile 装第二份 `@deepseek-ai/dsh-tools`**：两份拷贝 = 两个 `Symbol`，
+   `ctx.tools[TOOL_RUNTIME_SCHEDULER]` 变 `undefined`，每次工具调用都挂在
+   `Cannot read properties of undefined (reading 'prepare')`。web profile 的
+   `autoInstallPeers: false` 让 peer 走 dsh 自带那份，Dockerfile 里还有一条
+   `test ! -e …/@deepseek-ai/dsh-tools` 断言把它钉死。
+3. **`profiles/` 是镜像拥有的**：持久卷不能把它永久挡住，否则镜像升级（比如这次加插件）
+   永远进不去。entrypoint 每次启动用 `rsync -a --delete` 把镜像里的 profile 同步进卷，
+   **sessions/storages/凭据不动**（那是卷拥有的）。所以：**插件升级/新增插件 = 重建镜像 +
+   滚动更新**；会话数据不受影响。
+
+验证（都在 Pod 内真跑过）：
+
+```bash
+K="kubectl --kubeconfig ~/.kube/config_bi -n management"
+# 组合里这一行确实带上了我们的配置
+$K exec deploy/dsh-bi-interface -- bash -lc 'dsh --profile web --patch /tmp/dsh-patches/chrome-driverless.yml --dump-config | grep -A5 dsh-plugin-chrome-driverless'
+# 真驱动 BI 的 chrome（返回里有真 PNG 截图）
+$K exec deploy/dsh-bi-interface -- bash -lc 'B=http://chrome-driverless-mp2.management.svc.cluster.local; \
+  curl -s -X POST "$B/mcp" -H "content-type: application/json" -d "{\"method\":\"pw/navigate\",\"params\":{\"url\":\"https://example.com\"}}" | head -c 160'
+```
+
+⚠️ **工具要新建会话才可见**：会话的工具目录在会话创建时就定下来了，老会话里没有
+`browser_*`（这是 DSH 的行为，不是插件问题）。**新建一个会话**，让它「打开 example.com
+并截图」即可看到 `browser_open` / `browser_screenshot` 等 13 个工具。
+
+## 卡顿 / "思考卡住" 排查（实测结论）
+
+有人反馈"远程一直卡住、好几个思考都是 20 分钟前的"，本地桌面版正常。逐项量过之后：
+
+| 假设 | 实测 | 结论 |
+| --- | --- | --- |
+| Pod CPU 被限流/挨饿 | `cpu.pressure some avg10=0.00`；全生命周期只 throttle 42s；用量约 0.26 核 | 排除 |
+| 节点太忙（load 12.2/8 核） | 节点整机 `cpu.pressure some=73%`，但 Pod 自身 PSI=0（请求 500m 够用） | 不是我们被饿 |
+| 存储慢 | fsync 4-7ms、64MB 读 11ms；容器 overlay 与 `/root/data` **同一块 NVMe** | 排除 |
+| 模型 API 不通/慢 | Pod 内真 key 调用：非流式 ttfb 32ms 总 0.97s，流式 ttfb 96ms 总 1.15s，200 | 排除 |
+| 本地/远程配置不同 | 两边 `cordis.patch.yml` 都是空、`.credentials.yaml`/`settings.yaml` 一致 | 排除 |
+| 外层网关掐长轮询 | 3 个并发 `/plugins/events` 都跑到 90-92s 正常 200 | 排除 |
+| 每次请求的网关开销 | 连接复用后 p50≈0ms（之前看到的 480ms 是 curl 每次新建 TLS 的假象） | 排除 |
+
+剩下最像的机制：**SPA 的实时通道（`/api/remote.mux` WebSocket）被静默掐断，前端就永远停在旧状态**。
+证据：出问题时 Pod 完全空闲（无 CPU、无子进程）、模型 1 秒就回，但 ingress 日志里浏览器**有约 4 分钟一个请求都没有** —— 服务端没事，是浏览器侧停了。
+
+因此 0.5.0 起加了四件事：
+
+1. **WS keepalive**：反代在 101 之后每 25s 往浏览器发一个空 WS ping（`0x89 0x00`），
+   浏览器按 RFC 自动回 pong，字节流持续双向流动 → 中间两跳的空闲超时再也掐不断它。
+   （`DSH_WS_PING=0` 关闭，`DSH_WS_PING_MS` 调间隔）
+2. **完整可观测性**：`DSH_PROXY_LOG=0` 关闭，默认每个请求一行
+   `[access] GET /plugins/events -> 200 90123ms host=... via=cookie`，
+   WS 生命周期 `[ws] open/closed ... pings=N client->dsh=NB dsh->client=NB`，
+   以及 `[dsh] session for host=...`（dsh 的 per-boot 会话引导）。
+   **下次再卡，先看这三类日志**：
+   - `[access]` 断了 → 浏览器/标签页/本地网络停了（服务端无责）；
+   - 有 `[ws] closed` 且 `pings>0` 之后再没 `[ws] open` → 前端没重连，属前端行为；
+   - 一直没有任何 `[access]` 但你在操作 → 请求根本没到集群（网关/网络）。
+3. **持久化 `$DSH_HOME`**（`/root/data/dsh-home`）：以前 sessions/storages/投影缓存都在
+   容器可写层，**每次滚动更新都清空**，浏览器手里的 session 立刻变孤儿 —— 现象和"卡住"一模一样。
+   现在跨 Pod 重建保留（已用"写标记 → 删 Pod → 标记仍在、6 个 session 文件仍在"验证过）。
+4. **bootstrap 看门狗**：dsh 若不回 `/?token=` 交换，10s 后放弃等待（否则所有请求会排在
+   那个 promise 后面一起挂死）。
+
+另外两点运营注意：
+
+- 滚动更新/重启会立刻断开现有 WS，浏览器要刷新一次才会重连（这是前端行为，不是部署故障）。
+- 节点 `iz0xi7yxr2llsjyhd7mvksz` 是控制面 + kafka/postgres/ES/chrome 混布（load 10-12）；
+  单副本交互式 harness 想更稳，可考虑迁到空得多的 `iz0xi8kw308idqdw69tavxz`（把
+  `/root/data/{project,dsh-home}` 一起搬），但当前 PSI 显示我们并不缺 CPU。
+
 ## 已知限制
 
 - **单副本 + `Recreate`**：harness 持有长连接 session，不做多副本；更新会短暂中断
   （Pod 重建后 dsh 的 token 也会换新，浏览器刷新即可）。
 - **工作区绑定在单个节点**：见上一节，`hostPath` 跟着 `nodeSelector` 走，
   换节点要手动把目录准备好或改用 local PV。
-- **dsh 的 token 每次重启都变**：这是 dsh 的设计，人不用管 —— 反代会自动
-  引导浏览器走一遍 `/?token=`。代价是浏览器地址栏会短暂出现一次 `?token=…`。
-- **Basic Auth 靠浏览器弹窗**：浏览器对同源 WebSocket 握手会复用 Basic 凭据
-  （Chrome/Firefox 都如此，冒烟测试也覆盖了带 cookie 的 101）。要接 SSO 就把
-  反代那层换掉，或者在 ingress 上做 `auth-type: basic`。
+- **dsh 的 token 每次重启都变**：这是 dsh 的设计，人不用管 —— 反代在服务端
+  换它的会话并缓存；万一 dsh 中途重启，第一个 401 会自动触发重新引导并重试一次
+  （Bearer/Cookie 都不用动）。
+- **登录态是 Cookie，不是 Basic**：浏览器对同源 WebSocket 握手会带上 Cookie
+  （冒烟测试覆盖了带 Cookie 的 101）。`token` 模式下 HTTP auth 完全关闭；
+  要接 SSO 就把反代那层换掉，或者在 ingress 上做 `auth-type: basic`。
+- **token 泄露等于登录态泄露**：登录链接 `?dsh_token=…` 会短暂出现在地址栏/history
+  （反代立刻 303 抹掉），只在可信环境分享；轮换用 `AUTH_TOKEN=... ./deploy/apply.sh`。
 - `--host 0.0.0.0` 的限制没被绕过：dsh 仍然只监听 loopback，只有反代对外。
 - 容器内是 root，且挂着集群 admin 证书、节点上的项目目录 —— 这是「让 harness
   能干活」的代价，请注意这个 URL 谁能访问。

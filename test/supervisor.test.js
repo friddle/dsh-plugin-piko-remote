@@ -165,6 +165,30 @@ describe('createLineSplitter', () => {
   })
 })
 
+describe('buildHelperArgv TTL mapping', () => {
+  const base = {
+    helperPath: '/opt/piko-expose',
+    remote: 'https://piko.test',
+    endpoint: 'dsh-x',
+    port: 43120,
+    urlMode: 'subdomain',
+    basicAuth: true,
+    ttlMinutes: 0,
+  }
+
+  it('omits --auto-exit when no TTL was asked for', () => {
+    const argv = buildHelperArgv(base)
+    assert.equal(argv.includes('--auto-exit'), false, 'a permanent tunnel must not carry a deadline')
+  })
+
+  it('passes --auto-exit only for a positive TTL', () => {
+    const argv = buildHelperArgv({ ...base, ttlMinutes: 30 })
+    const index = argv.indexOf('--auto-exit')
+    assert.notEqual(index, -1)
+    assert.equal(argv[index + 1], '30')
+  })
+})
+
 describe('TunnelSupervisor.expose', () => {
   it('resolves once the helper reports ready, with credentials from the auth event', async () => {
     const { supervisor, specs, handles } = makeSupervisor()

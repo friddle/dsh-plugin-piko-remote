@@ -28,14 +28,27 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: dsh
-          image: registry.code27.co/app/dsh-bi-interface:0.1.0
+          image: registry.code27.co/app/dsh-bi-interface:0.6.1
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
               containerPort: 8080
               protocol: TCP
           env:
-            # Basic Auth in front of `dsh web` (dsh itself has no auth).
+            # Auth model: token -> signed HttpOnly session cookie (login once).
+            # `token` = no HTTP auth at all; `both` also accepts Basic for
+            # `curl -u`; `basic` is the legacy challenge-everything mode.
+            - name: DSH_AUTH_MODE
+              value: token
+            - name: DSH_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: dsh-bi-interface-auth
+                  key: token
+            # Sliding session lifetime in seconds (30d).
+            - name: DSH_SESSION_TTL
+              value: "2592000"
+            # Only used when DSH_AUTH_MODE is both/basic.
             - name: DSH_AUTH_USER
               valueFrom:
                 secretKeyRef:
@@ -50,7 +63,11 @@ spec:
             - name: DSH_TRUSTED_HOST
               value: dsh-bi-interface.management.code27.co,localhost:3080,127.0.0.1:3080
             - name: DSH_HOME
-              value: /root/.dsh
+              value: /opt/dsh-home
+            # chrome-driverless plugin target: the service already running in
+            # this cluster (no docker socket in the pod, manageContainer=false).
+            - name: DSH_CHROME_BASE_URL
+              value: http://chrome-driverless-mp2.management.svc.cluster.local
             - name: DSH_CONFIG_DIR
               value: /etc/dsh-credentials
             - name: WORKSPACE_DIR
@@ -74,6 +91,10 @@ spec:
             # Node-local persistent project dir (see deploy/apply.sh + volumes).
             - name: project
               mountPath: /root/data/project
+            # dsh's own state (sessions/storages/profile cache) must survive
+            # restarts, otherwise open tabs lose their session.
+            - name: dsh-home
+              mountPath: /opt/dsh-home
           startupProbe:
             httpGet:
               path: /__healthz
@@ -121,4 +142,9 @@ spec:
         - name: project
           hostPath:
             path: /root/data/project
+            type: Directory
+        # Sessions/storages/projection cache: same disk, but persistent.
+        - name: dsh-home
+          hostPath:
+            path: /root/data/dsh-home
             type: Directory

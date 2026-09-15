@@ -116,6 +116,22 @@ RUN set -eux; \
     rm -f /tmp/web-tree.txt
 
 # ---------------------------------------------------------------------------
+# Plugins baked into the web profile.
+#
+# chrome-driverless drives the chrome-driverless service that already runs in
+# this cluster (see the DSH_CHROME_BASE_URL default in entrypoint.sh); there is
+# no docker socket in the pod, so the plugin never manages a container itself.
+# ---------------------------------------------------------------------------
+ARG CHROME_PLUGIN_SPEC=github:friddle/dsh-plugin-chrome-driverless#v0.1.0
+RUN set -eux; \
+    dsh plugin --profile web add "$CHROME_PLUGIN_SPEC"; \
+    test ! -e "$DSH_HOME/profiles/web/node_modules/@deepseek-ai/dsh-tools"; \
+    dsh --profile web --dump-config > /tmp/web-tree.txt; \
+    grep -q 'chrome-driverless' /tmp/web-tree.txt; \
+    cat /tmp/web-tree.txt | grep -A3 -i 'chrome-driverless' | head -8; \
+    rm -f /tmp/web-tree.txt
+
+# ---------------------------------------------------------------------------
 # Login shells (`bash -lc`, which agent tools love to spawn) start from
 # /etc/profile and would otherwise lose Go from PATH — ENV alone is not enough.
 # ---------------------------------------------------------------------------
@@ -132,7 +148,15 @@ RUN set -eux; \
 # ---------------------------------------------------------------------------
 COPY auth-proxy.mjs /usr/local/lib/dsh-proxy/auth-proxy.mjs
 COPY entrypoint.sh /usr/local/bin/dsh-entrypoint
+# Patch overlays for the baked plugins (rendered at boot by entrypoint.sh).
+COPY patches /opt/dsh/patches
 RUN chmod 0755 /usr/local/bin/dsh-entrypoint /usr/local/lib/dsh-proxy/auth-proxy.mjs
+
+# Auth defaults live down here on purpose: adding an ENV before the apt/npm
+# layers would invalidate their cache and cost a full ~10min rebuild.
+# `token` = cookie session only, no HTTP auth prompts; see auth-proxy.mjs.
+ENV DSH_AUTH_MODE=token \
+    DSH_SESSION_TTL=2592000
 
 RUN mkdir -p "$WORKSPACE_DIR" "$DSH_HOME"
 

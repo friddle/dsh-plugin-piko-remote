@@ -266,7 +266,9 @@ scripts/smoke-test.sh     # 真实公网链路：起目标服务 → 连 piko �
 - 代价必须说清楚：**URL 就是密码**。它出现在浏览器历史、Referer、聊天记录里都可能被拿走；
   cookie 也没有 `Secure` 标记、有效期 30 天、没有账号维度、没有速率限制。要第二层就
   `--basic-auth`（可配 `--auth-user/--auth-pass` 固定账号）。
-- TTL 默认非空（120 分钟）；
+- **TTL 默认不过期**（`--ttl 0`）。设了 `--ttl N` 时，helper 到点自动退出，公网 URL 会变成
+  `404 {"error":"no available upstreams"}` —— 注意这时 DSH 本体还在跑（回环地址照常），
+  只是隧道没了；`dsh-piko-remote status` 能看出 `expires` 字段；
 - `allowDshUiExpose` 默认关，`remote_expose` 在未打开时会拒绝暴露 DSH 端口；
 - 插件日志只记录 endpoint，不记录完整 URL 和账号密码。
 

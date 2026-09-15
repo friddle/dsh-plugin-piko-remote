@@ -25,7 +25,30 @@ WORKSPACE_DIR="${WORKSPACE_DIR:-/workspace}"
 DSH_TRUSTED_HOST="${DSH_TRUSTED_HOST:-}"
 DSH_PROXY_BIND="${DSH_PROXY_BIND:-0.0.0.0}"
 DSH_LOG="${DSH_LOG:-/tmp/dsh-web.log}"
+PATCH_DIR="${PATCH_DIR:-/opt/dsh/patches}"
+PATCH_RENDER_DIR="${PATCH_RENDER_DIR:-/tmp/dsh-patches}"
 export DSH_HOME DSH_PORT DSH_PROXY_PORT DSH_PROXY_BIND
+
+# --- persistent DSH_HOME -------------------------------------------------
+# The image bakes the warmed profile at /root/.dsh, but the container's own
+# filesystem is thrown away on every pod restart — which loses sessions/ and
+# storages/ and leaves open browser tabs pointing at a session the server no
+# longer has (they look "stuck" until a refresh). When DSH_HOME points at a
+# mounted volume, seed it once from the baked skeleton and keep using the volume.
+DSH_SEED_DIR="${DSH_SEED_DIR:-/root/.dsh}"
+if [[ "$DSH_HOME" != "$DSH_SEED_DIR" ]]; then
+	mkdir -p "$DSH_HOME"
+	# profiles/ is IMAGE-owned (plugins are installed at build time), so it is
+	# re-synced from the image on every boot — otherwise an existing volume would
+	# permanently shadow newer images and image upgrades would never arrive.
+	# sessions/ storages/ and the credential files stay volume-owned: never
+	# deleted here.
+	if [[ -d "$DSH_SEED_DIR/profiles" ]]; then
+		mkdir -p "$DSH_HOME/profiles"
+		rsync -a --delete "$DSH_SEED_DIR/profiles/" "$DSH_HOME/profiles/"
+		echo "[entrypoint] synced the image profile into $DSH_HOME/profiles"
+	fi
+fi
 
 mkdir -p "$DSH_HOME" "$WORKSPACE_DIR"
 
@@ -49,20 +72,37 @@ if [[ -d /root/.ssh ]]; then
 fi
 
 # --- dsh web -----------------------------------------------------------
-# --no-open: there is no browser in here, and dsh would try to launch one.
-args=(web --host 127.0.0.1 --port "$DSH_PORT" --no-open)
+# Invoked as `dsh --profile web …` rather than the `dsh web` alias: the alias
+# rejects the parent's --patch flag ("web takes none of parent --patch"), and we
+# need --patch for the baked plugin config.
+launcher_args=(--profile web)
+app_args=(--host 127.0.0.1 --port "$DSH_PORT" --no-open)
 if [[ -n "$DSH_TRUSTED_HOST" ]]; then
 	IFS=',' read -r -a trusted <<< "$DSH_TRUSTED_HOST"
 	for host in "${trusted[@]}"; do
 		host="${host#"${host%%[![:space:]]*}"}"
 		host="${host%"${host##*[![:space:]]}"}"
-		[[ -n "$host" ]] && args+=(--trusted-host "$host")
+		[[ -n "$host" ]] && app_args+=(--trusted-host "$host")
 	done
 fi
 
-echo "[entrypoint] starting: dsh ${args[*]}"
+# Render the baked patch overlays (plugin config). The chrome-driverless service
+# is the one running in this cluster; manageContainer must stay off (no docker).
+DSH_CHROME_BASE_URL="${DSH_CHROME_BASE_URL:-http://chrome-driverless-mp2.management.svc.cluster.local}"
+if [[ -d "$PATCH_DIR" ]]; then
+	mkdir -p "$PATCH_RENDER_DIR"
+	for template in "$PATCH_DIR"/*.yml.tmpl; do
+		[[ -e "$template" ]] || continue
+		rendered="$PATCH_RENDER_DIR/$(basename "${template%.tmpl}")"
+		sed "s|@DSH_CHROME_BASE_URL@|${DSH_CHROME_BASE_URL}|g" "$template" >"$rendered"
+		launcher_args+=(--patch "$rendered")
+		echo "[entrypoint] patch $(basename "$rendered") (chrome baseUrl=${DSH_CHROME_BASE_URL})"
+	done
+fi
+
+echo "[entrypoint] starting: dsh ${launcher_args[*]} ${app_args[*]}"
 : >"$DSH_LOG"
-(cd "$WORKSPACE_DIR" && dsh "${args[@]}") >"$DSH_LOG" 2>&1 &
+(cd "$WORKSPACE_DIR" && dsh "${launcher_args[@]}" "${app_args[@]}") >"$DSH_LOG" 2>&1 &
 DSH_PID=$!
 
 shutdown() {
