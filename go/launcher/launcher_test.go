@@ -1019,3 +1019,15 @@ func TestDshProfileOf(t *testing.T) {
 		}
 	}
 }
+
+func TestInstancesBesides(t *testing.T) {
+	// The status report is about one instance; counting it as an "other" would
+	// make every healthy machine look contended.
+	ps := strings.Join([]string{
+		"  123 node /x/bin/dsh --profile piko",
+		"  124 node /x/bin/dsh --profile web",
+	}, "\n")
+	if got := parseDshProcesses(ps, "", 999); len(got) != 2 {
+		t.Fatalf("fixture should yield two instances: %v", got)
+	}
+}

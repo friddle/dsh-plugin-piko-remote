@@ -108,6 +108,20 @@ func dshProfileOf(args string) (string, bool) {
 	return "", false
 }
 
+// instancesBesides lists live dsh instances other than one pid.
+//
+// @param except - a pid to ignore (the instance a report is about).
+// @returns the remaining pids.
+func instancesBesides(except int) []int {
+	others := make([]int, 0, 4)
+	for _, pid := range liveDshProcesses("") {
+		if pid != except {
+			others = append(others, pid)
+		}
+	}
+	return others
+}
+
 // stopPreviousRuns makes this machine single-instance for one profile.
 //
 // @param log - logger for the operator-facing explanation.

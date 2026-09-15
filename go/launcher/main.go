@@ -801,7 +801,7 @@ func cmdStatus(argv []string) error {
 	// Other instances on this machine are the reason a session can be owned
 	// elsewhere: their holder cannot be resumed here, which silently kills the
 	// UI's command menu. Report them instead of leaving the operator to guess.
-	others := liveDshProcesses("")
+	others := instancesBesides(state.PID)
 
 	if opts.jsonOut {
 		payload := map[string]any{
