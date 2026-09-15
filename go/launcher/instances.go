@@ -17,6 +17,7 @@ package main
 import (
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -38,10 +39,14 @@ func liveDshProcesses(profile string) []int {
 // parseDshProcesses is the pure half of {@link liveDshProcesses}, so the
 // matching rules can be tested without a process table.
 //
-// A row counts when its argv looks like a dsh CLI invocation with a `--profile`
-// argument: the launcher starts `<node> <dsh> --profile <name> …`, and matching
-// on the flag rather than on the binary name alone keeps a `grep dsh` or an
-// unrelated path containing "dsh" out of the result.
+// A row counts only when dsh is the program being run — `argv[0]` or `argv[1]`
+// must be named `dsh`, which is the shape of the launcher's own start
+// (`<node> <dsh> --profile …`) and of a directly executed dsh binary.
+//
+// Matching on the `--profile` flag alone is not enough, and neither is a
+// substring test for "dsh": the shell that invokes the launcher carries both
+// `--profile piko` and the dsh path in its own argv, so a looser rule makes the
+// launcher stop its own caller.
 //
 // @param psOutput - `ps -eo pid=,args=` output.
 // @param profile - profile to match; empty matches every dsh instance.
@@ -77,15 +82,26 @@ func parseDshProcesses(psOutput, profile string, self int) []int {
 // @param args - the process's argv, space-joined.
 // @returns the profile name and whether the row is a dsh invocation.
 func dshProfileOf(args string) (string, bool) {
-	if !strings.Contains(args, "dsh") {
+	tokens := strings.Fields(args)
+	if len(tokens) < 2 {
 		return "", false
 	}
-	tokens := strings.Fields(args)
-	for index, token := range tokens {
-		if token == "--profile" && index+1 < len(tokens) {
+
+	// `<node> <dsh> …` (the launcher's shape) or `<dsh> …` (a binary entry).
+	entry := 0
+	switch {
+	case filepath.Base(tokens[0]) == "dsh":
+	case filepath.Base(tokens[1]) == "dsh":
+		entry = 1
+	default:
+		return "", false
+	}
+
+	for index := entry + 1; index < len(tokens); index++ {
+		if tokens[index] == "--profile" && index+1 < len(tokens) {
 			return tokens[index+1], true
 		}
-		if value, found := strings.CutPrefix(token, "--profile="); found {
+		if value, found := strings.CutPrefix(tokens[index], "--profile="); found {
 			return value, true
 		}
 	}

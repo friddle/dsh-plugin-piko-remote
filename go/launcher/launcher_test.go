@@ -964,6 +964,8 @@ func TestParseDshProcesses(t *testing.T) {
 		"  126 node /usr/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --profile piko",
 		"  127 node /opt/bin/dsh --no-open",
 		"  128 ps -eo pid=,args=",
+		"  129 bash -c N=/n; L=/bin/dsh-piko-remote-linux-amd64; $L up --profile piko --dsh /n/bin/dsh",
+		"  130 /home/u/bin/dsh-piko-remote-linux-amd64 up --profile piko --dsh /n/bin/dsh",
 		"not-a-pid node /opt/bin/dsh --profile piko",
 	}, "\n")
 
@@ -973,9 +975,9 @@ func TestParseDshProcesses(t *testing.T) {
 		self    int
 		want    string
 	}{
-		{"only this profile's instances match", "piko", 999, "123 126"},
-		{"an empty profile matches every instance", "", 999, "123 124 126"},
-		{"this process is never reported", "piko", 123, "126"},
+		{"only real dsh processes match", "piko", 999, "123"},
+		{"an empty profile matches every instance", "", 999, "123 124"},
+		{"this process is never reported", "piko", 123, ""},
 		{"an unused profile matches nothing", "absent", 999, ""},
 	}
 	for _, test := range cases {
@@ -1001,11 +1003,14 @@ func TestDshProfileOf(t *testing.T) {
 		isDsh  bool
 		reason string
 	}{
-		{"node /x/bin/dsh --profile piko --no-open", "piko", true, "the launcher's own shape"},
+		{"node /x/bin/dsh --profile piko --no-open", "piko", true, "the launcher's own start shape"},
 		{"node /x/bin/dsh --profile=web", "web", true, "equals form"},
 		{"node /x/bin/dsh --no-open", "", false, "no profile flag is not an instance"},
 		{"grep dsh --profile", "", false, "a trailing flag names nothing"},
 		{"tail -f /var/log/other.log", "", false, "unrelated processes are ignored"},
+		{"node /usr/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --profile piko", "", false, "a non-dsh entry point"},
+		{"bash -c L=/bin/dsh-piko-remote-linux-amd64; $L up --profile piko --dsh /n/bin/dsh", "", false, "the invoking shell mentions dsh but does not run it"},
+		{"/home/u/bin/dsh-piko-remote-linux-amd64 up --profile piko --dsh /n/bin/dsh", "", false, "the launcher itself is not an instance"},
 	}
 	for _, test := range cases {
 		name, isDsh := dshProfileOf(test.args)
