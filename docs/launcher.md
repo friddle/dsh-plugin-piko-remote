@@ -91,6 +91,14 @@ dsh-piko-remote up --json                # 给脚本用：stdout 只有一行 JS
 | `--no-sandbox` | `false` | 新会话默认用 `danger-full-access`：命令不加沙箱包装、审批也关掉。等价于 `--env DSH_PERMISSION_MODE=danger-full-access`；调用方自己指定了 `DSH_PERMISSION_MODE` 时不覆盖（只 warn） |
 | `--force` | `false` | 强制重装 node 与 dsh |
 
+## 重启与登录态
+
+- **本地端口会复用**：cookie 的 authority 是 `127.0.0.1:<port>`，所以随机端口=每次重启都把浏览器踢下线。
+  现在 `up` 会读上次记录的 `localUrl`，端口仍空着就继续用（`--port` 显式给值优先；被占则退回随机）。
+- **launch token 每次都换**：URL 里那个 `?token=` 是进程级的，旧链接 401 是正常的；
+  `dsh-piko-remote status`（或 `access.json`）里有当前带 token 的地址。访问一次换到 30 天 cookie 之后，
+  就不再需要 token 了。
+
 ## 一台机器只能有一个实例
 
 DSH 把会话放在 `$DSH_HOME/sessions`，一个会话同时只归一个进程所有。**两个实例共用一个

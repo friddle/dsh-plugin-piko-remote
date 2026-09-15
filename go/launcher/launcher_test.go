@@ -6,7 +6,9 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1079,5 +1081,49 @@ func TestTTLDefaultsToNeverExpire(t *testing.T) {
 	}
 	if opts.ttlMinutes != 60 {
 		t.Fatalf("--ttl 60 = %d", opts.ttlMinutes)
+	}
+}
+
+func TestPortReuseKeepsTheSessionAuthorityStable(t *testing.T) {
+	// The browser cookie's authority is `127.0.0.1:<port>`, so a new random port
+	// silently signs every existing session out.
+	cases := []struct {
+		url  string
+		want int
+	}{
+		{"http://127.0.0.1:38235/?token=abc", 38235},
+		{"http://127.0.0.1:8080/", 8080},
+		{"http://127.0.0.1/", 0},
+		{"", 0},
+		{"not a url", 0},
+	}
+	for _, test := range cases {
+		if got := portFromURL(test.url); got != test.want {
+			t.Errorf("portFromURL(%q) = %d, want %d", test.url, got, test.want)
+		}
+	}
+
+	// An explicit request wins over the recorded port.
+	if got := resolveWebPort(testLogger(), 9999, "http://127.0.0.1:38235/?token=abc"); got != 9999 {
+		t.Fatalf("explicit port = %d", got)
+	}
+
+	// Nothing recorded means the OS chooses.
+	if got := resolveWebPort(testLogger(), 0, ""); got != 0 {
+		t.Fatalf("no previous URL should yield 0, got %d", got)
+	}
+
+	// A free recorded port is reused; a busy one is dropped rather than fought over.
+	if !portFree(0) {
+		t.Skip("cannot bind a loopback port here")
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	busy := listener.Addr().(*net.TCPAddr).Port
+	if got := resolveWebPort(testLogger(), 0, fmt.Sprintf("http://127.0.0.1:%d/?token=x", busy)); got != 0 {
+		t.Fatalf("a busy port must not be reused, got %d", got)
 	}
 }

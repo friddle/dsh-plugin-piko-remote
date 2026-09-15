@@ -122,6 +122,19 @@ func instancesBesides(except int) []int {
 	return others
 }
 
+// previousLocalURL is the local URL the last run of this profile recorded, or
+// "" when there is nothing to reuse.
+//
+// @param dataDir - launcher state directory.
+// @returns the recorded local URL.
+func previousLocalURL(dataDir string) string {
+	state, err := loadState(statePath(dataDir))
+	if err != nil {
+		return ""
+	}
+	return state.LocalURL
+}
+
 // stopPreviousRuns makes this machine single-instance for one profile.
 //
 // @param log - logger for the operator-facing explanation.

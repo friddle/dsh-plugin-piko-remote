@@ -263,6 +263,11 @@ scripts/smoke-test.sh     # 真实公网链路：起目标服务 → 连 piko �
   `client-connection/browser-session` 记录里）。之后每个请求都要带这个 cookie，否则 401
   `dsh web authentication required`。因为签名密钥是持久的，**cookie 能活过 DSH 重启**，
   变的只是 URL 里那个 launch token。
+- **重启不再把你踢下线**：cookie 绑定的是 `127.0.0.1:<端口>`，而端口以前是每次随机（`--port 0`）
+  → 一重启 cookie 就作废，浏览器只剩 `401 dsh web authentication required`。现在启动器会**复用上一次的
+  端口**（明确给了 `--port` 则以它为准；端口被占才重新随机），所以访问过一次的浏览器在重启后依然登录。
+  但 **URL 里的 launch token 每次重启都会变**：旧 token 的链接会 401，需要重新取一次（`dsh-piko-remote
+  status` 会打印当前带 token 的地址）。
 - 代价必须说清楚：**URL 就是密码**。它出现在浏览器历史、Referer、聊天记录里都可能被拿走；
   cookie 也没有 `Secure` 标记、有效期 30 天、没有账号维度、没有速率限制。要第二层就
   `--basic-auth`（可配 `--auth-user/--auth-pass` 固定账号）。

@@ -432,20 +432,19 @@ func cmdUp(argv []string) error {
 		log.warn("profile has no %s; starting DSH without tunnel configuration", pikoRemotePackage)
 	}
 
-	// The port is always passed, defaulting to 0 (OS-assigned). A fixed default
-	// collides with any other DSH already running — including a second profile on
-	// the same machine — and the port is irrelevant to the caller anyway: the
-	// tunnel URL and its target port come from the running server.
 	// Extra args come before the app-level flags: parent-level options such as
 	// --patch must precede the app's own positionals, or the app's parser sees
-	// them and rejects them as unknown.
+	// them and rejects them as unknown. The port is resolved after the previous
+	// run is stopped, from the URL that run recorded.
 	args = append(args, opts.dshArgs...)
-	args = append(args, "--no-open", "--port", fmt.Sprint(opts.port))
 
 	// `up` owns this profile: a previous run of the same profile is stopped
 	// first, because two instances on one DSH home break session ownership (the
 	// UI's command menu and every human command fail with SessionAlreadyOwned).
+	// Stopping first also frees the port the previous run held, which is what
+	// lets this run reuse it.
 	stopPreviousRuns(log, opts.profile)
+	args = append(args, "--no-open", "--port", fmt.Sprint(resolveWebPort(log, opts.port, previousLocalURL(opts.dataDir))))
 
 	state := runState{
 		Profile:    opts.profile,
