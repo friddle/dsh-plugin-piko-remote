@@ -16,3 +16,6 @@ go/launcher/assets/piko-expose-*
 
 # Packed plugin artifacts
 *.tgz
+
+# k8s deploy staging: real kubeconfig / credentials, never commit these.
+deploy/.secrets/

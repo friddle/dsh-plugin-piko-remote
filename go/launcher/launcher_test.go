@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -951,6 +952,65 @@ func TestRenderOverlayAddsTheSandboxAdapter(t *testing.T) {
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("overlay is missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestParseDshProcesses(t *testing.T) {
+	ps := strings.Join([]string{
+		"  123 node /home/u/node/bin/dsh --profile piko --patch /x.yml --no-open --port 0",
+		"  124 /opt/bin/node /opt/bin/dsh --profile=web --no-open",
+		"  125 /bin/sh -c grep dsh --profile",
+		"  126 node /usr/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --profile piko",
+		"  127 node /opt/bin/dsh --no-open",
+		"  128 ps -eo pid=,args=",
+		"not-a-pid node /opt/bin/dsh --profile piko",
+	}, "\n")
+
+	cases := []struct {
+		reason  string
+		profile string
+		self    int
+		want    string
+	}{
+		{"only this profile's instances match", "piko", 999, "123 126"},
+		{"an empty profile matches every instance", "", 999, "123 124 126"},
+		{"this process is never reported", "piko", 123, "126"},
+		{"an unused profile matches nothing", "absent", 999, ""},
+	}
+	for _, test := range cases {
+		got := parseDshProcesses(ps, test.profile, test.self)
+		rendered := make([]string, 0, len(got))
+		for _, pid := range got {
+			rendered = append(rendered, strconv.Itoa(pid))
+		}
+		if strings.Join(rendered, " ") != test.want {
+			t.Errorf("%s: parseDshProcesses(%q) = %v, want %q", test.reason, test.profile, got, test.want)
+		}
+	}
+
+	if got := parseDshProcesses("", "", 999); len(got) != 0 {
+		t.Fatalf("empty output must not report instances: %v", got)
+	}
+}
+
+func TestDshProfileOf(t *testing.T) {
+	cases := []struct {
+		args   string
+		name   string
+		isDsh  bool
+		reason string
+	}{
+		{"node /x/bin/dsh --profile piko --no-open", "piko", true, "the launcher's own shape"},
+		{"node /x/bin/dsh --profile=web", "web", true, "equals form"},
+		{"node /x/bin/dsh --no-open", "", false, "no profile flag is not an instance"},
+		{"grep dsh --profile", "", false, "a trailing flag names nothing"},
+		{"tail -f /var/log/other.log", "", false, "unrelated processes are ignored"},
+	}
+	for _, test := range cases {
+		name, isDsh := dshProfileOf(test.args)
+		if name != test.name || isDsh != test.isDsh {
+			t.Errorf("%s: dshProfileOf(%q) = %q, %v; want %q, %v", test.reason, test.args, name, isDsh, test.name, test.isDsh)
 		}
 	}
 }

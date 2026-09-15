@@ -1,0 +1,35 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: dsh-bi-interface
+  namespace: management
+  labels:
+    app.kubernetes.io/name: dsh-bi-interface
+    app.kubernetes.io/component: dsh-web
+  annotations:
+    # Same conventions as the other *.management.code27.co ingresses in this cluster.
+    cert-manager.io/cluster-issuer: letsencrypt-cloudflare-issuer
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    # The browser UI keeps a long-lived WebSocket open on /api/remote.mux.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # Terminal/agent traffic can be large; no body cap.
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: dsh-bi-interface.management.code27.co
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: dsh-bi-interface
+                port:
+                  number: 80
+  tls:
+    - hosts:
+        - dsh-bi-interface.management.code27.co
+      secretName: dsh-bi-interface-management-tls

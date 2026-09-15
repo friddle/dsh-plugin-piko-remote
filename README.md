@@ -233,6 +233,13 @@ sh: cannot create /etc/probe: Read-only file system
   `https://<endpoint>.<base>/?token=…`，外面再套一层本插件的 Basic Auth。
   自动暴露（`autoExpose`）时用 `credentialsFile` 把地址与随机账号密码以 0600 权限落盘。
 
+## 一台机器只能有一个实例
+
+两个实例共用 `$DSH_HOME` 会互相抢会话所有权：客户端列斜杠指令时要 resume 当前会话，
+抢输的那个是 `SessionAlreadyOwnedError` → 指令目录加载失败 → `/` 菜单空白、`/compact`
+报失败，且服务端不留日志。启动器因此会**先停掉同一 profile 的旧进程**（`up` 自带这步），
+并在 `status` 里列出机器上其它 dsh 进程；真要并行就各给一个 `--dsh-home`。
+
 ## 验证
 
 ```bash

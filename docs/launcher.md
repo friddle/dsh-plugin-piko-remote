@@ -91,6 +91,21 @@ dsh-piko-remote up --json                # 给脚本用：stdout 只有一行 JS
 | `--no-sandbox` | `false` | 新会话默认用 `danger-full-access`：命令不加沙箱包装、审批也关掉。等价于 `--env DSH_PERMISSION_MODE=danger-full-access`；调用方自己指定了 `DSH_PERMISSION_MODE` 时不覆盖（只 warn） |
 | `--force` | `false` | 强制重装 node 与 dsh |
 
+## 一台机器只能有一个实例
+
+DSH 把会话放在 `$DSH_HOME/sessions`，一个会话同时只归一个进程所有。**两个实例共用一个
+DSH home 会互相抢会话**：Web 客户端要列出斜杠指令时会先 resume 当前会话，抢输的那个拿到
+`SessionAlreadyOwnedError`，于是指令目录加载失败——`/` 菜单空白、`/compact`「执行失败」，
+而服务端一条日志都没有（因为根本没有 turn 开始）。
+
+所以 `up` 把 profile 当成自己的：启动前会**先停掉同一 profile 的上一个进程**（并说明原因），
+如果机器上还有别的 profile 的 dsh 在跑，会警告一句（它们同样共享这个 home 时，会话会抢）。
+`status` 也会列出这些进程。想同时跑两个实例，就给它们不同的 `--dsh-home`。
+
+```bash
+dsh-piko-remote up --dsh-home ~/.dsh-b      # 第二实例：独立 home，互不干扰
+```
+
 ## 沙箱开关
 
 启动器不替换执行器插件，只改**默认策略模式**（`DSH_PERMISSION_MODE`）：宿主组合里

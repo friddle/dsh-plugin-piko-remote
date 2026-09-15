@@ -32,7 +32,7 @@ import (
 )
 
 // version is the launcher's own version.
-const version = "0.1.0"
+const version = "0.1.1"
 
 // defaultDshVersion is pinned rather than `latest`: the plugin declares its peer
 // range against this line, and "it worked yesterday" is worth more than new.
@@ -427,6 +427,11 @@ func cmdUp(argv []string) error {
 	args = append(args, opts.dshArgs...)
 	args = append(args, "--no-open", "--port", fmt.Sprint(opts.port))
 
+	// `up` owns this profile: a previous run of the same profile is stopped
+	// first, because two instances on one DSH home break session ownership (the
+	// UI's command menu and every human command fail with SessionAlreadyOwned).
+	stopPreviousRuns(log, opts.profile)
+
 	state := runState{
 		Profile:    opts.profile,
 		LogFile:    filepath.Join(opts.dataDir, "logs", "dsh-"+opts.profile+".log"),
@@ -793,21 +798,26 @@ func cmdStatus(argv []string) error {
 		return nil
 	}
 	running := processAlive(state.PID)
+	// Other instances on this machine are the reason a session can be owned
+	// elsewhere: their holder cannot be resumed here, which silently kills the
+	// UI's command menu. Report them instead of leaving the operator to guess.
+	others := liveDshProcesses("")
 
 	if opts.jsonOut {
 		payload := map[string]any{
-			"event":     "status",
-			"running":   running,
-			"profile":   state.Profile,
-			"pid":       state.PID,
-			"localUrl":  state.LocalURL,
-			"remoteUrl": state.RemoteURL,
-			"endpoint":  state.Endpoint,
-			"authUser":  state.AuthUser,
-			"authPass":  state.AuthPass,
-			"expiresAt": state.ExpiresAt,
-			"logFile":   state.LogFile,
-			"startedAt": state.StartedAt,
+			"event":             "status",
+			"running":           running,
+			"profile":           state.Profile,
+			"pid":               state.PID,
+			"localUrl":          state.LocalURL,
+			"remoteUrl":         state.RemoteURL,
+			"otherDshInstances": others,
+			"endpoint":          state.Endpoint,
+			"authUser":          state.AuthUser,
+			"authPass":          state.AuthPass,
+			"expiresAt":         state.ExpiresAt,
+			"logFile":           state.LogFile,
+			"startedAt":         state.StartedAt,
 		}
 		if state.TunnelNote != "" {
 			payload["tunnelNote"] = state.TunnelNote
@@ -836,6 +846,13 @@ func cmdStatus(argv []string) error {
 	}
 	fmt.Fprintf(os.Stdout, "  log          %s\n", state.LogFile)
 	fmt.Fprintln(os.Stdout)
+
+	if len(others) > 0 {
+		log.warn(
+			"%d other dsh instance(s) running (%v); if they share this DSH home, sessions they hold cannot be resumed here and the UI's command menu will fail",
+			len(others), others,
+		)
+	}
 	return nil
 }
 
