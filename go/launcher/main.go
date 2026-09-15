@@ -854,7 +854,11 @@ func cmdStatus(argv []string) error {
 	}
 	if state.RemoteURL != "" {
 		fmt.Fprintf(os.Stdout, "  public url   %s\n", state.RemoteURL)
-		fmt.Fprintf(os.Stdout, "  auth         %s / %s\n", state.AuthUser, state.AuthPass)
+		// Printed only when the tunnel actually carries credentials; with Basic
+		// Auth off the URL's own ?token= is the credential.
+		if state.AuthUser != "" || state.AuthPass != "" {
+			fmt.Fprintf(os.Stdout, "  auth         %s / %s\n", state.AuthUser, state.AuthPass)
+		}
 	}
 	if state.TunnelNote != "" {
 		fmt.Fprintf(os.Stdout, "  tunnel       %s\n", state.TunnelNote)
