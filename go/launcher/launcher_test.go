@@ -1031,3 +1031,32 @@ func TestInstancesBesides(t *testing.T) {
 		t.Fatalf("fixture should yield two instances: %v", got)
 	}
 }
+
+func TestBasicAuthDefaultsOff(t *testing.T) {
+	// The DSH ?token= fence is the credential; Basic Auth is a second layer an
+	// operator can ask for, not the default.
+	opts, err := parseUpFlags(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.basicAuth {
+		t.Fatal("Basic Auth must be off by default: the token fence already gates the UI")
+	}
+
+	opts, err = parseUpFlags([]string{"--basic-auth"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !opts.basicAuth {
+		t.Fatal("--basic-auth must turn the tunnel credential back on")
+	}
+
+	// Exposing the UI with Basic Auth off is a choice, not an error.
+	opts, err = parseUpFlags([]string{"--expose-dsh-ui", "--basic-auth=false"})
+	if err != nil {
+		t.Fatalf("the combination must be allowed: %v", err)
+	}
+	if !opts.exposeDshUI || opts.basicAuth {
+		t.Fatalf("unexpected options: %+v", opts)
+	}
+}

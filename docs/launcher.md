@@ -78,7 +78,7 @@ dsh-piko-remote up --json                # 给脚本用：stdout 只有一行 JS
 | `--remote URL` | `https://clauded.friddle.me` | piko 服务器 |
 | `--endpoint NAME` | 随机 | 固定 endpoint 名（例如要配合 `--trusted-host` 时） |
 | `--ttl MINUTES` | `480` | 隧道存活时间，`0` = 不过期 |
-| `--basic-auth` | `true` | 隧道 Basic Auth（`--expose-dsh-ui` 时不允许关） |
+| `--basic-auth` | `false` | 隧道 HTTP Basic Auth。**默认关**：DSH 自带的 `?token=` 围栏才是真正的凭证（启动 token → 30 天签名 cookie，`HttpOnly; SameSite=Strict`，密钥持久化）。打开就是加第二层，账号可用 `--auth-user/--auth-pass` 固定 |
 | `--expose-dsh-ui` | `true` | 允许暴露 DSH 自己的界面；关掉则只装插件不暴露 |
 | `--credentials-file F` | `<data-dir>/access.json` | 隧道地址与账号密码落盘位置（0600） |
 | `--dsh PATH` / `--dsh-version V` | — / `0.1.5-rc.1` | 用现成的 dsh / 指定安装版本 |
@@ -131,8 +131,11 @@ dsh-piko-remote up --sandbox-runner bwrap-noproc   # 或 auto
 
 ## 安全
 
-- `--expose-dsh-ui` 默认开，因为这就是这个工具的用途；但它**要求 Basic Auth 开着**，
-  两者同时关闭会被直接拒绝——那等于把本机的 Agent 无凭证挂到公网。
+- `--expose-dsh-ui` 默认开，因为这就是这个工具的用途。**凭证默认只有 DSH 的 `?token=` 一层**：
+  每次启动一个 launch token，用带 token 的 URL 访问一次换一个 30 天签名 cookie
+  （绑定 Host、HMAC-SHA256、密钥存在 `~/.dsh/.credentials.yaml`），此后请求必须带它。
+  代价是 **URL 即密码**（历史/Referer/聊天里都可能泄露，cookie 无 `Secure`、30 天、无账号维度），
+  想加第二层就 `--basic-auth`。
 - 隧道账号密码由插件随机生成，落在 `--credentials-file`（0600），日志里不出现。
 - API token（`?token=...`）每次启动都会变，`status` 会重新读出来。
 

@@ -255,7 +255,17 @@ scripts/smoke-test.sh     # 真实公网链路：起目标服务 → 连 piko �
 暴露 DSH 自己的 Web 界面等于**把本机 Agent 的控制权交给任何拿到该 URL 的人**。
 因此：
 
-- Basic Auth 默认开，账号密码随机生成（20 位，去掉易混字符）；
+- **凭证默认只有一层：DSH 自己的 `?token=`。** 启动器不再默认给隧道加 HTTP Basic Auth
+  （要加就 `--basic-auth`）。这一层的机制是：每次启动 DSH 生成一个进程级 launch token，
+  写在它打印的 URL 里；用这个 URL 访问一次，服务端就下发一个 **30 天**（`cookieMaxAgeDays`，
+  默认 30）的签名 cookie（`HttpOnly; SameSite=Strict; Path=/`，内容绑定 Host 与该次签发/过期
+  时间，HMAC-SHA256 签名，密钥持久化在 `~/.dsh/.credentials.yaml` 的
+  `client-connection/browser-session` 记录里）。之后每个请求都要带这个 cookie，否则 401
+  `dsh web authentication required`。因为签名密钥是持久的，**cookie 能活过 DSH 重启**，
+  变的只是 URL 里那个 launch token。
+- 代价必须说清楚：**URL 就是密码**。它出现在浏览器历史、Referer、聊天记录里都可能被拿走；
+  cookie 也没有 `Secure` 标记、有效期 30 天、没有账号维度、没有速率限制。要第二层就
+  `--basic-auth`（可配 `--auth-user/--auth-pass` 固定账号）。
 - TTL 默认非空（120 分钟）；
 - `allowDshUiExpose` 默认关，`remote_expose` 在未打开时会拒绝暴露 DSH 端口；
 - 插件日志只记录 endpoint，不记录完整 URL 和账号密码。

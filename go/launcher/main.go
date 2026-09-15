@@ -117,8 +117,10 @@ up flags:
   --remote URL          piko server (default `+defaultRemote+`)
   --endpoint NAME       fixed endpoint name; default: random per boot
   --ttl MINUTES         tunnel lifetime (default `+fmt.Sprint(defaultTTLMinutes)+`; 0 = never expire)
-  --basic-auth          keep Basic Auth on the tunnel (default true)
-  --expose-dsh-ui       allow exposing the DSH Web UI itself (default true; needs Basic Auth)
+  --basic-auth          turn HTTP Basic Auth back on for the tunnel (default off:
+                        the DSH ?token= fence is the credential — a per-boot launch
+                        token exchanged for a 30-day signed HttpOnly cookie)
+  --expose-dsh-ui       allow exposing the DSH Web UI itself (default true)
   --port PORT           DSH web port (default 0: the OS picks one, which avoids
                         colliding with another DSH already on this machine)
   --credentials-file F  where the tunnel access record is written
@@ -126,8 +128,8 @@ up flags:
   --dsh-version V       dsh version to install (default `+defaultDshVersion+`)
   --dsh-arg ARG         extra argument for dsh, repeatable
   --env KEY=VALUE       environment entry for dsh, repeatable (e.g. the model key)
-  --auth-user USER      fixed tunnel Basic Auth user (default: random)
-  --auth-pass PASS      fixed tunnel Basic Auth password (default: random)
+  --auth-user USER      fixed tunnel Basic Auth user (only with --basic-auth)
+  --auth-pass PASS      fixed tunnel Basic Auth password (only with --basic-auth)
   --node PATH           use this node instead of installing one
   --node-version V      Node version to install when needed (default `+defaultNodeVersion+`)
   --registry URL        npm registry for installs
@@ -268,7 +270,7 @@ func parseUpFlags(argv []string) (*upOptions, error) {
 	flags.StringVar(&opts.remote, "remote", defaultRemote, "piko server URL")
 	flags.StringVar(&opts.endpoint, "endpoint", "", "fixed endpoint name")
 	flags.IntVar(&opts.ttlMinutes, "ttl", defaultTTLMinutes, "tunnel lifetime in minutes")
-	flags.BoolVar(&opts.basicAuth, "basic-auth", true, "require Basic Auth on the tunnel")
+	flags.BoolVar(&opts.basicAuth, "basic-auth", false, "require Basic Auth on the tunnel (default off: the DSH ?token= fence is the only credential)")
 	flags.BoolVar(&opts.exposeDshUI, "expose-dsh-ui", true, "allow exposing the DSH Web UI")
 	flags.IntVar(&opts.port, "port", 0, "DSH web port (0 = let the OS pick)")
 	flags.StringVar(&opts.credentials, "credentials-file", "", "tunnel access record path")
@@ -306,8 +308,17 @@ func parseUpFlags(argv []string) (*upOptions, error) {
 		// fixed user with a random password is a footgun worth naming.
 		fmt.Fprintln(os.Stderr, "warning: --auth-user without --auth-pass keeps a randomly generated password")
 	}
+	// Two credentials can guard the tunnel: the piko helper's HTTP Basic Auth and
+	// the DSH Web server's own `?token=` fence (exchanged for a signed, HttpOnly,
+	// SameSite=Strict cookie bound to the authority, valid for
+	// `cookieMaxAgeDays`, default 30). The token is the real credential, so Basic
+	// Auth is off by default — one credential to share instead of two — but the
+	// consequence is worth saying out loud, because the URL *is* the password.
 	if !opts.basicAuth && opts.exposeDshUI {
-		return nil, errors.New("--expose-dsh-ui with --basic-auth=false would publish this machine's agent with no credential at all; keep Basic Auth on")
+		fmt.Fprintln(os.Stderr, "warning: --basic-auth=false leaves the DSH ?token= URL as the only credential; anyone who obtains that URL can drive this machine's agent")
+	}
+	if !opts.basicAuth && (opts.authUser != "" || opts.authPass != "") {
+		fmt.Fprintln(os.Stderr, "warning: --auth-user/--auth-pass are ignored while Basic Auth is off")
 	}
 	return opts, nil
 }
@@ -522,7 +533,11 @@ func reportReady(log *logger, opts *upOptions, nodeVersion, dshVersion string, i
 	fmt.Fprintf(os.Stdout, "  local url    %s\n", localURL)
 	if publicURL != "" {
 		fmt.Fprintf(os.Stdout, "  public url   %s\n", publicURL)
-		fmt.Fprintf(os.Stdout, "  auth         %s / %s\n", state.AuthUser, state.AuthPass)
+		// With Basic Auth off there are no tunnel credentials to print; the URL's
+		// own ?token= is the credential, which is already in `public url`.
+		if state.AuthUser != "" || state.AuthPass != "" {
+			fmt.Fprintf(os.Stdout, "  auth         %s / %s\n", state.AuthUser, state.AuthPass)
+		}
 		if state.ExpiresAt != "" {
 			fmt.Fprintf(os.Stdout, "  expires      %s\n", state.ExpiresAt)
 		}
