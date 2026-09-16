@@ -393,6 +393,17 @@ func cmdUp(argv []string) error {
 		return err
 	}
 
+	// A pinned endpoint lets DSH see the browser's real Host, which makes the
+	// browser cookie's authority the public name instead of a throwaway loopback
+	// port — the difference between "restart signs me out" and a session that
+	// survives restarts. DSH needs that name in its trust fence for /api.
+	trustedHost := ""
+	if wantsTunnel {
+		if authority := publicAuthority(opts.endpoint, opts.remote); authority != "" {
+			trustedHost = authority
+		}
+	}
+
 	args := []string{"--profile", opts.profile}
 	if wantsTunnel || sandbox != nil {
 		overlayPath := filepath.Join(opts.dataDir, "piko-remote.overlay.yml")
@@ -403,7 +414,7 @@ func cmdUp(argv []string) error {
 			BasicAuthUser:     opts.authUser,
 			BasicAuthPass:     opts.authPass,
 			URLMode:           "subdomain",
-			PreserveHost:      false,
+			PreserveHost:      trustedHost != "",
 			AllowDshUiExpose:  opts.exposeDshUI,
 			AutoExpose:        opts.exposeDshUI,
 			DefaultTTLMinutes: opts.ttlMinutes,
@@ -444,6 +455,11 @@ func cmdUp(argv []string) error {
 	// Stopping first also frees the port the previous run held, which is what
 	// lets this run reuse it.
 	stopPreviousRuns(log, opts.profile)
+	if trustedHost != "" {
+		// App-level flag: it belongs with the web app's own options.
+		args = append(args, "--trusted-host", trustedHost)
+		log.info("preserving the browser Host; dsh trusts %s for /api", trustedHost)
+	}
 	args = append(args, "--no-open", "--port", fmt.Sprint(resolveWebPort(log, opts.port, previousLocalURL(opts.dataDir))))
 
 	state := runState{

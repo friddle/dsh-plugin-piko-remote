@@ -1127,3 +1127,21 @@ func TestPortReuseKeepsTheSessionAuthorityStable(t *testing.T) {
 		t.Fatalf("a busy port must not be reused, got %d", got)
 	}
 }
+
+func TestPublicAuthority(t *testing.T) {
+	cases := []struct {
+		endpoint string
+		remote   string
+		want     string
+	}{
+		{"dsh-browser", "https://clauded.tools.yicoson.cn", "dsh-browser.clauded.tools.yicoson.cn"},
+		{"dsh-browser", "https://clauded.tools.yicoson.cn:8443", "dsh-browser.clauded.tools.yicoson.cn:8443"},
+		{"", "https://clauded.tools.yicoson.cn", ""},
+		{"dsh-browser", "not a url", ""},
+	}
+	for _, test := range cases {
+		if got := publicAuthority(test.endpoint, test.remote); got != test.want {
+			t.Errorf("publicAuthority(%q, %q) = %q, want %q", test.endpoint, test.remote, got, test.want)
+		}
+	}
+}

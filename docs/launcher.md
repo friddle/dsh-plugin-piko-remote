@@ -93,8 +93,12 @@ dsh-piko-remote up --json                # 给脚本用：stdout 只有一行 JS
 
 ## 重启与登录态
 
-- **本地端口会复用**：cookie 的 authority 是 `127.0.0.1:<port>`，所以随机端口=每次重启都把浏览器踢下线。
-  现在 `up` 会读上次记录的 `localUrl`，端口仍空着就继续用（`--port` 显式给值优先；被占则退回随机）。
+- **固定 endpoint 时保留真实 Host**：`--endpoint dsh-browser` 会被展开成
+  `preserveHost: true` + `dsh web --trusted-host dsh-browser.<piko域名>`。这样 cookie 的 authority 是稳定的
+  公网域名（实测 payload `"authority":"dsh-browser.clauded.tools.yicoson.cn"`），重启/换端口都不会掉登录态；
+  代价是域名必须固定（`--trusted-host` 不支持通配符）。
+- **没有固定 endpoint 时复用端口**：authority 退化为 `127.0.0.1:<port>`，于是 `up` 会读上次记录的
+  `localUrl` 并继续用同一个端口（`--port` 显式给值优先；被占则退回随机并 warning）。
 - **launch token 每次都换**：URL 里那个 `?token=` 是进程级的，旧链接 401 是正常的；
   `dsh-piko-remote status`（或 `access.json`）里有当前带 token 的地址。访问一次换到 30 天 cookie 之后，
   就不再需要 token 了。
